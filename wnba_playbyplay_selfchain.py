@@ -40,7 +40,7 @@ from curl_cffi import requests
 from wnba_playbyplay_gate import _game_is_relevant_now
 from wnba_playbyplay_live import get_todays_events
 
-THIS_REPO = "drewgp1127/wnba-live-playbyplay"
+THIS_REPO = "FirstIQ/wnba-live-playbyplay"
 THIS_WORKFLOW = "live-playbyplay.yml"
 BRANCH = "master"
 
