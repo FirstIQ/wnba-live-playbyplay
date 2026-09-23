@@ -96,7 +96,7 @@ FB_HEADER = ["Event ID", "Date", "Matchup", "Player", "Athlete ID", "Team", "Pos
 # polls every 5 minutes during game windows, so it double-duties as the
 # trigger: once a game is a few minutes into Q1, fire an extra one-off
 # intraday run via the GitHub API instead of waiting for the clock.
-MAIN_PIPELINE_REPO = "drewgp1127/bball-bots"
+MAIN_PIPELINE_REPO = "FirstIQ/bball-bots"
 MAIN_PIPELINE_INTRADAY_WORKFLOW = "intraday-updates.yml"
 MAIN_PIPELINE_BRANCH = "master"
 DISPATCH_LOG_SHEET_NAME = "Post-Tip Dispatch Log"
