@@ -109,7 +109,11 @@ def _game_is_relevant_now(event, now_utc):
         return 0 <= minutes_from_tip <= POST_GAME_GRACE_MINUTES
     # "pre" (or an unrecognised state): once tip-off is close enough that the
     # NEXT cron firing would already be too late -- see LOOKAHEAD_MINUTES.
-return -LOOKAHEAD_MINUTES <= minutes_from_tip <= POST_GAME_GRACE_MINUTES
+    # And still relevant AFTER the scheduled tip: ESPN keeps a game "pre"
+    # until it flips it live, which lags the real tip. On 2026-09-24 both
+    # pre-game runs started at 00:01Z, a minute past ATL @ NYL's tip, saw
+    # "pre", and skipped the whole game when this upper bound was 0.
+    return -LOOKAHEAD_MINUTES <= minutes_from_tip <= POST_GAME_GRACE_MINUTES
 
 
 def should_poll():
