@@ -109,7 +109,7 @@ def _game_is_relevant_now(event, now_utc):
         return 0 <= minutes_from_tip <= POST_GAME_GRACE_MINUTES
     # "pre" (or an unrecognised state): once tip-off is close enough that the
     # NEXT cron firing would already be too late -- see LOOKAHEAD_MINUTES.
-    return -LOOKAHEAD_MINUTES <= minutes_from_tip <= 0
+return -LOOKAHEAD_MINUTES <= minutes_from_tip <= POST_GAME_GRACE_MINUTES
 
 
 def should_poll():
