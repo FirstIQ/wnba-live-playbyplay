@@ -262,23 +262,55 @@ def format_shot_method(type_text, points):
     return base
 
 
+def _sequence(play, index):
+    try:
+        return int(play.get("sequenceNumber"))
+    except (TypeError, ValueError):
+        return index
+
+
+def _score_total(play):
+    try:
+        return int(play.get("awayScore") or 0) + int(play.get("homeScore") or 0)
+    except (TypeError, ValueError):
+        return None
+
+
 def find_first_basket(plays, team_id_to_name):
     """Scans ALL plays (not just the first-4-minutes window below) for the
     game's actual first made shot -- same definition the main pipeline's
     analyze_game() uses (first scoringPlay with a shooter), just evaluated
-    live instead of after the whole game is final."""
-    for play in plays:
+    live instead of after the whole game is final.
+
+    Two guards, both from LVA @ GSV on 2026-10-04 (event 401918296), where
+    this wrote A'ja Wilson's 7:51 jumper -- the game's THIRD score -- over
+    Chelsea Gray's 8:27 three:
+
+    - Sorted by ESPN's sequenceNumber rather than trusted in array order.
+      The feed is usually in order and sometimes is not.
+    - The candidate must be the game's first points: the score after it
+      has to equal its own value. A play that lands at 5-2 for 2 points
+      means earlier points exist that this poll's feed is missing or has
+      not flagged yet, so there is no answer this poll -- the next one
+      retries, rather than a wrong row being written once and kept."""
+    ordered = sorted(enumerate(plays), key=lambda pair: _sequence(pair[1], pair[0]))
+    for _, play in ordered:
         if not play.get("scoringPlay", False):
             continue
         participants = play.get("participants", [])
         athlete_id = participants[0]["athlete"]["id"] if participants else None
         if not athlete_id:
             continue
+        points = play.get("scoreValue") or play.get("pointsAttempted")
+        total = _score_total(play)
+        if total is not None and points and total != points:
+            print(f"    First scoring play in the feed lands at a total of {total} for {points} point(s) "
+                  f"-- earlier points are missing from this poll; not recording a first basket yet.")
+            return None
         player = get_player(athlete_id)
         if player is None:
             return None  # unresolved lookup -- retry this event on the next poll
         team_id = play.get("team", {}).get("id", "")
-        points = play.get("scoreValue") or play.get("pointsAttempted")
         return {
             "name": player["name"],
             "athlete_id": athlete_id,
@@ -289,6 +321,21 @@ def find_first_basket(plays, team_id_to_name):
             "clock": play.get("clock", {}).get("displayValue", ""),
         }
     return None
+
+
+def first_basket_correction(existing_row, first_basket):
+    """The row to write over an existing 'Live First Basket' row, or None
+    when it already names this scorer. Keeps the row's Event ID, Date,
+    Matchup and Captured At: the app keys alerts on the event id and times
+    them by Captured At, so a correction must change WHO and nothing else."""
+    if not existing_row or first_basket is None:
+        return None
+    padded = list(existing_row) + [""] * (len(FB_HEADER) - len(existing_row))
+    if padded[4] == str(first_basket["athlete_id"]):
+        return None
+    return padded[:3] + [first_basket["name"], first_basket["athlete_id"], first_basket["team"],
+                         first_basket["position"], first_basket["method"], first_basket["period"],
+                         first_basket["clock"], padded[10]]
 
 
 def fetch_game_data(event_id):
@@ -374,6 +421,8 @@ def main():
         fb_existing_values = [FB_HEADER]
     fb_existing_rows = fb_existing_values[1:]
     fb_known_event_ids = {r[0] for r in fb_existing_rows if r}
+    # event_id -> (sheet row number, row). Row 1 is the header.
+    fb_rows_by_event = {r[0]: (i + 2, r) for i, r in enumerate(fb_existing_rows) if r}
 
     dispatch_token = os.environ.get("MAIN_PIPELINE_DISPATCH_TOKEN")
     dispatch_ws = get_or_create_tab(spreadsheet, DISPATCH_LOG_SHEET_NAME, DISPATCH_LOG_HEADER)
@@ -390,6 +439,7 @@ def main():
 
     updates = {}  # event_id -> new_rows, only for events actually re-fetched
     fb_new_rows = []  # newly-identified first baskets this run
+    fb_corrections = []  # (sheet row number, corrected row)
     grade_ready = []  # events whose opening just became fully decided
     today_str = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
     now_str = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -431,8 +481,31 @@ def main():
             else:
                 print("    Dispatch failed -- will retry next run.")
 
+        def queue_correction(first_basket):
+            if event_id not in fb_rows_by_event:
+                return
+            row_number, existing = fb_rows_by_event[event_id]
+            corrected = first_basket_correction(existing, first_basket)
+            if corrected is None:
+                return
+            fb_corrections.append((row_number, corrected))
+            fb_rows_by_event[event_id] = (row_number, corrected)
+            print(f"    CORRECTING first basket: {existing[3] if len(existing) > 3 else '?'} -> "
+                  f"{first_basket['name']} ({first_basket['team']}) -- ESPN's feed changed since the row was written.")
+
         rows_for_event = [r for r in existing_rows if r and r[0] == event_id]
         if rows_for_event and event_already_captured(rows_for_event):
+            # The row may still be wrong: a game is usually fully captured on
+            # the same poll its first basket is written, so a scorer ESPN
+            # corrected (or a play it posted late) was never looked at again.
+            # Re-check while the game is live: one summary fetch per live
+            # game per poll, and it stops the moment the game goes final.
+            if state == "in" and event_id in fb_rows_by_event:
+                try:
+                    _, _, rechecked = fetch_game_data(event_id)
+                    queue_correction(rechecked)
+                except Exception as e:
+                    print(f"    Could not re-check first basket for {matchup}: {e}")
             # Nothing left to fetch for this game -- but if its grading
             # dispatch never went out (it failed, or this game was
             # captured before live grading existed), fire it now. The
@@ -449,6 +522,8 @@ def main():
             print(f"    Could not fetch: {e}")
             continue
 
+        if first_basket and event_id in fb_known_event_ids:
+            queue_correction(first_basket)
         if first_basket and event_id not in fb_known_event_ids:
             fb_new_rows.append([event_id, today_str, matchup, first_basket["name"], first_basket["athlete_id"],
                                  first_basket["team"], first_basket["position"], first_basket["method"],
@@ -476,6 +551,13 @@ def main():
     if fb_new_rows:
         print(f"Writing Live First Basket: {len(fb_new_rows)} new game(s).")
         fb_ws.append_rows(fb_new_rows, value_input_option="USER_ENTERED")
+
+    for row_number, corrected in fb_corrections:
+        # A PUT on a fixed range: safe to retry, unlike the append above.
+        fb_ws.update(range_name=f"A{row_number}:K{row_number}", values=[corrected],
+                     value_input_option="USER_ENTERED")
+    if fb_corrections:
+        print(f"Corrected Live First Basket: {len(fb_corrections)} row(s).")
 
     if updates:
         # RE-READ before writing back, and rebuild from the fresh copy.
