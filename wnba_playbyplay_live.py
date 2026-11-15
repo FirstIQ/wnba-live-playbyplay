@@ -17,8 +17,12 @@ fixed window (this used to stop at the first 4 minutes of Q1) silently
 drops the "First Team Basket" market whenever the slower-scoring team
 doesn't get on the board that early, which happens often enough to
 matter. There's no reliable time bound for "how long until both teams
-have scored," so this just keeps capturing until it actually happens (or
-the game ends).
+have scored," so this just keeps capturing until it actually happens --
+but never past the end of period 1 (hard stop, 2026-11-15). Plays are put
+in game order first (ESPN's array is in entry order), a score is counted
+the app's way (flagged, at least 1 point, one of the two teams), and a
+feed that contradicts itself is not written. A capture left incomplete is
+repaired the next morning by bball-bots' wnba_playbyplay_tab.py.
 
 Safe to re-run: upserts (replaces) rows for any event ID it touches, never
 appends duplicates. Skips games it has already fully captured (an
@@ -175,11 +179,56 @@ def get_abbr(full_name, espn_fallback):
 
 
 def parse_clock_to_seconds(display_value):
+    """'9:47' -> 587; '45.3' -> 45 (ESPN's last-minute format, which used
+    to come back None and drop the period's final minute)."""
     try:
+        if ":" not in display_value:
+            whole, tenths = display_value.split(".")
+            return int(whole) if tenths.isdigit() else None
         minutes, seconds = display_value.split(":")
         return int(minutes) * 60 + int(seconds)
-    except (ValueError, AttributeError):
+    except (ValueError, AttributeError, TypeError):
         return None
+
+
+def _int_or_none(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def in_game_order(plays):
+    """Period 1 plays with a readable clock, in GAME order: period, clock
+    running down, then ESPN's sequenceNumber. ESPN's array is in entry
+    order, which is not game order (BKN @ CLE, 2026-10-24: free throws at
+    11:16 were entered after a three at 10:51). Same key as the app's
+    basketball orderKey and bball-bots' wnba_playbyplay_tab.py.
+
+    Period 1 only: the opening is never read past it (hard stop, decided
+    2026-11-15)."""
+    keyed = []
+    for i, play in enumerate(plays):
+        if play.get("period", {}).get("number") != 1:
+            continue
+        seconds = parse_clock_to_seconds(play.get("clock", {}).get("displayValue", ""))
+        if seconds is None:
+            continue
+        sequence = _int_or_none(play.get("sequenceNumber"))
+        keyed.append(((-seconds, sequence if sequence is not None else i, i), play))
+    return [play for _, play in sorted(keyed, key=lambda kp: kp[0])]
+
+
+def counts_as_score(play, team_ids):
+    """The app's rule: flagged scoring, worth at least 1 point, by one of
+    the game's two teams."""
+    return (play.get("scoringPlay", False) is True
+            and (_int_or_none(play.get("scoreValue")) or 0) >= 1
+            and play.get("team", {}).get("id") in team_ids)
+
+
+def reaches_past_period_1(plays):
+    return any((play.get("period", {}).get("number") or 0) > 1 for play in plays)
 
 
 def event_already_captured(rows_for_event):
@@ -263,12 +312,13 @@ def format_shot_method(type_text, points):
 
 
 def find_first_basket(plays, team_id_to_name):
-    """Scans ALL plays (not just the first-4-minutes window below) for the
-    game's actual first made shot -- same definition the main pipeline's
-    analyze_game() uses (first scoringPlay with a shooter), just evaluated
-    live instead of after the whole game is final."""
-    for play in plays:
-        if not play.get("scoringPlay", False):
+    """The game's first score in period 1, in game order, by the app's
+    rule (see counts_as_score). Period 1 only: on 401857190 a broken live
+    feed showed every period 1 shot missed, and this recorded a period 3
+    layup as the first basket -- a row that is written once and never
+    revisited."""
+    for play in in_game_order(plays):
+        if not counts_as_score(play, team_id_to_name):
             continue
         participants = play.get("participants", [])
         athlete_id = participants[0]["athlete"]["id"] if participants else None
@@ -291,6 +341,11 @@ def find_first_basket(plays, team_id_to_name):
     return None
 
 
+class UntrustedFeed(Exception):
+    """The feed contradicts itself. Nothing is written for the game this
+    poll; the next poll tries again."""
+
+
 def fetch_game_data(event_id):
     """Returns (rows, fully_captured, first_basket) from a single fetch.
     rows covers every play up through the point where both teams have
@@ -305,32 +360,48 @@ def fetch_game_data(event_id):
     plays = data["plays"]
     competitors = data["header"]["competitions"][0]["competitors"]
     team_id_to_name = {c["team"]["id"]: c["team"]["displayName"] for c in competitors}
+    side_ids = {c["homeAway"]: c["team"]["id"] for c in competitors}
 
     first_basket = find_first_basket(plays, team_id_to_name)
 
     rows = []
     teams_scored = set()
     fully_captured = False
-    for play in plays:
+    max_score = {"away": 0, "home": 0}
+    for play in in_game_order(plays):
         period = play.get("period", {}).get("number")
-        if period is None:
-            continue
         clock_display = play.get("clock", {}).get("displayValue", "")
         seconds_remaining = parse_clock_to_seconds(clock_display)
-        if seconds_remaining is None:
-            continue
         team_id = play.get("team", {}).get("id", "")
+        if (play.get("scoringPlay", False) is True and (_int_or_none(play.get("scoreValue")) or 0) >= 1
+                and team_id and team_id not in team_id_to_name):
+            raise UntrustedFeed(f"scoring play by team {team_id!r}, not one of this game's two teams")
         team_name = team_id_to_name.get(team_id, team_id or "")
         away_score = play.get("awayScore", "")
         home_score = play.get("homeScore", "")
         text = play.get("text", "")
-        is_score = play.get("scoringPlay", False)
+        is_score = counts_as_score(play, team_id_to_name)
         rows.append((period, clock_display, seconds_remaining, team_name, away_score, home_score, text, "Y" if is_score else "N"))
-        if is_score and team_name:
-            teams_scored.add(team_name)
+        max_score["away"] = max(max_score["away"], _int_or_none(away_score) or 0)
+        max_score["home"] = max(max_score["home"], _int_or_none(home_score) or 0)
+        if is_score:
+            teams_scored.add(team_id)
         if len(teams_scored) >= 2:
             fully_captured = True
             break
+
+    # The running score must be explained by the saved scoring plays.
+    for side in ("away", "home"):
+        if max_score[side] > 0 and side_ids[side] not in teams_scored:
+            raise UntrustedFeed(f"running score shows the {side} team with {max_score[side]} point(s) "
+                                f"but no saved play is its score")
+
+    # Period 1 is over with only one team on the board: that team's
+    # opponent truly first scores later, and the capture is done. With
+    # NEITHER team on the board it is not done -- no real game goes a
+    # period without a score; a broken feed does -- so it is re-fetched.
+    if not fully_captured and teams_scored and reaches_past_period_1(plays):
+        fully_captured = True
     return rows, fully_captured, first_basket
 
 
@@ -445,6 +516,9 @@ def main():
         print(f"  Fetching {matchup} (event {event_id}, status: {state})...")
         try:
             plays, fully_captured, first_basket = fetch_game_data(event_id)
+        except UntrustedFeed as e:
+            print(f"    Feed rejected, will retry next poll: {e}")
+            continue
         except Exception as e:
             print(f"    Could not fetch: {e}")
             continue
