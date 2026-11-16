@@ -9,6 +9,8 @@ must start ONE successor however many leagues still have games.
     pip install pytest && python -m pytest tests/ -q
 """
 
+import os
+import subprocess
 import sys
 from unittest import mock
 
@@ -55,9 +57,10 @@ def runs(monkeypatch):
     calls = []
     codes = {}
 
-    def run(argv, env=None, **kwargs):
+    def run(argv, env=None, timeout=None, **kwargs):
         key = env["FIRSTIQ_LEAGUE"]
-        calls.append({"argv": argv, "league": key, "dry_run": env.get("FIRSTIQ_DRY_RUN", "")})
+        calls.append({"argv": argv, "league": key, "dry_run": env.get("FIRSTIQ_DRY_RUN", ""),
+                      "timeout": timeout})
         outcome = codes.get(key, 0)
         if isinstance(outcome, Exception):
             raise outcome
@@ -107,7 +110,17 @@ class TestPoll:
         relevant(monkeypatch, wnba=True, nba=True)
         assert cycle.poll() == 0
         assert [c["league"] for c in calls] == ["wnba", "nba"]
-        assert all(c["argv"] == [sys.executable, "wnba_playbyplay_live.py"] for c in calls)
+        assert all(c["argv"] == [sys.executable, cycle.WATCHER] for c in calls)
+        assert cycle.WATCHER.endswith("wnba_playbyplay_live.py") and os.path.isfile(cycle.WATCHER)
+
+    def test_a_hung_poll_is_given_a_ceiling(self, monkeypatch, runs):
+        """The Sheets client has no timeout of its own, and the polls run
+        one after the other: a hang in one would hold the other forever."""
+        calls, _ = runs
+        relevant(monkeypatch, wnba=True, nba=True)
+        cycle.poll()
+        assert [c["timeout"] for c in calls] == [cycle.POLL_TIMEOUT_SECONDS] * 2
+        assert 300 < cycle.POLL_TIMEOUT_SECONDS <= 900
 
     def test_a_league_with_no_game_on_is_not_polled(self, monkeypatch, runs):
         """Four full-tab reads a poll, on a quota shared with bball-bots."""
@@ -116,7 +129,8 @@ class TestPoll:
         assert cycle.poll() == 0
         assert [c["league"] for c in calls] == ["nba"]
 
-    @pytest.mark.parametrize("failure", [1, OSError("could not start")])
+    @pytest.mark.parametrize("failure", [
+        1, OSError("could not start"), subprocess.TimeoutExpired("watcher", 900)])
     def test_one_league_failing_does_not_stop_the_other(self, monkeypatch, runs, failure, capsys):
         calls, codes = runs
         codes["wnba"] = failure

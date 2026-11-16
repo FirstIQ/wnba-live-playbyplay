@@ -101,10 +101,13 @@ class TestADryPoll:
 
     def test_a_failed_access_check_says_unknown_and_carries_on(self, monkeypatch, dry, capsys):
         world = wnba_world()
-        world.client.http_client.request = mock.Mock(side_effect=RuntimeError("Drive API not enabled"))
+        world.client.http_client.request = mock.Mock(
+            side_effect=RuntimeError("Drive API has not been used in project 123456789012"))
         world.run(monkeypatch)
         out = capsys.readouterr().out
-        assert "can edit this sheet: unknown" in out and "would rewrite 'Play By Play'" in out
+        assert "can edit this sheet: unknown (RuntimeError)" in out and "would rewrite 'Play By Play'" in out
+        # Drive's own words name the file and the Google Cloud project.
+        assert "123456789012" not in out
 
     def test_the_sheet_id_is_never_printed(self, monkeypatch, dry, capsys):
         """This repo's Actions logs are public."""

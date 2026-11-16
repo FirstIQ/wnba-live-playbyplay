@@ -32,7 +32,8 @@ STAR_B = team("97", "Team World", "WLD")
 NOW = datetime(2026, 11, 17, 0, 30, tzinfo=timezone.utc)
 
 # The stand-in sheet ID: a test never needs the real one.
-NBA = dataclasses.replace(leagues.NBA, spreadsheet_id="nba-test-sheet")
+NBA_TEST_SHEET = "nba-test-sheet-0123456789abcdefABCDEF"
+NBA = dataclasses.replace(leagues.NBA, spreadsheet_id=NBA_TEST_SHEET)
 
 
 @pytest.fixture
@@ -151,7 +152,7 @@ def test_one_nba_poll_end_to_end(monkeypatch, nba):
     monkeypatch.setenv("MAIN_PIPELINE_DISPATCH_TOKEN", "test-token")
     world = nba_world().run(monkeypatch)
 
-    assert world.client.opened == ["nba-test-sheet"]
+    assert world.client.opened == [NBA_TEST_SHEET]
     assert world.fetched == [
         "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates=20260917",
         "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event=501",
@@ -180,13 +181,49 @@ def test_one_nba_poll_end_to_end(monkeypatch, nba):
         "Live First Basket", "Live Grading Dispatch Log", "Post-Tip Dispatch Log"]
 
 
-def test_a_league_with_no_sheet_id_refuses_to_run(monkeypatch):
-    """Nothing is fetched and no sheet is opened."""
-    use(monkeypatch, dataclasses.replace(leagues.NBA, spreadsheet_id=""))
-    world = nba_world()
-    with pytest.raises(SystemExit, match="no sheet ID"):
-        world.run(monkeypatch)
-    assert world.client.opened == [] and world.fetched == []
+class TestTheSheetIdIsChecked:
+    """The NBA sheet's ID comes from the environment, so it can be missing,
+    mangled, or -- worst -- the WNBA sheet's."""
+
+    @pytest.mark.parametrize("sheet_id, problem", [
+        ("", "no sheet ID is configured"),
+        (f"https://docs.google.com/spreadsheets/d/{NBA_TEST_SHEET}/edit#gid=0", "not a sheet ID"),
+        (NBA_TEST_SHEET + "\n", "not a sheet ID"),
+        (" " + NBA_TEST_SHEET, "not a sheet ID"),
+        ("too-short", "not a sheet ID"),
+        (leagues.WNBA.spreadsheet_id, "another league's sheet"),
+    ])
+    def test_a_bad_id_stops_the_run_before_anything_is_fetched_or_opened(self, monkeypatch, sheet_id, problem, capsys):
+        use(monkeypatch, dataclasses.replace(leagues.NBA, spreadsheet_id=sheet_id))
+        world = nba_world()
+        with pytest.raises(SystemExit, match=problem) as stop:
+            world.run(monkeypatch)
+        assert world.client.opened == [] and world.fetched == []
+        # And the refusal does not echo what it was given.
+        assert sheet_id == "" or sheet_id not in str(stop.value)
+
+    def test_a_good_id_has_no_problem(self):
+        assert leagues.sheet_problem(NBA) is None
+        assert leagues.sheet_problem(leagues.WNBA) is None
+
+    def test_the_id_is_not_in_the_settings_repr(self):
+        assert NBA_TEST_SHEET not in repr(NBA)
+        assert leagues.WNBA.spreadsheet_id not in repr(leagues.WNBA)
+
+
+def test_a_crash_never_prints_a_sheet_id(monkeypatch, nba, capsys):
+    """A Sheets error names the request's URL, the URL holds the sheet ID,
+    and this repo's Actions logs are public."""
+    def boom():
+        raise RuntimeError(f"Max retries exceeded with url: /v4/spreadsheets/{NBA_TEST_SHEET}/values/A1")
+
+    monkeypatch.setattr(live, "main", boom)
+    with pytest.raises(SystemExit) as stop:
+        live.run()
+    assert stop.value.code == 1
+    err = capsys.readouterr().err
+    assert "RuntimeError" in err and "/v4/spreadsheets/<sheet>/values/A1" in err
+    assert NBA_TEST_SHEET not in err
 
 
 def test_the_rewrite_logs_its_row_counts_and_how_long_it_took(monkeypatch, nba, capsys):

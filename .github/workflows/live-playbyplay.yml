@@ -26,6 +26,10 @@ on:
         type: boolean
         default: false
 
+# Nothing here uses the built-in token: the dispatches use their own tokens.
+permissions:
+  contents: read
+
 concurrency:
   # Never let two of these loops write to the shared Google Sheets at the
   # same time -- the script does a full clear()+rewrite of the Play By
@@ -57,6 +61,9 @@ jobs:
       PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@v4
+        with:
+          # No step runs git after this, so no step needs the token left on disk.
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:

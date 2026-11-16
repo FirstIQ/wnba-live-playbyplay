@@ -61,6 +61,7 @@ dry_run_enabled().
 import os
 import sys
 import time
+import traceback
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -465,10 +466,14 @@ def report_edit_access(client, spreadsheet_id):
             params={"fields": "capabilities(canEdit)", "supportsAllDrives": "true"})
         can_edit = response.json()["capabilities"]["canEdit"]
     except Exception as e:
-        # Never echo the sheet ID: this repo's Actions logs are public,
-        # and Drive's error text names the file.
-        reason = f"{type(e).__name__}: {e}".replace(spreadsheet_id, "<sheet>")
-        print(f"DRY RUN: the service account can edit this sheet: unknown ({reason})")
+        # The reason is the error's type and HTTP status, never its text:
+        # this repo's Actions logs are public, and Drive's messages name the
+        # file and the Google Cloud project.
+        status = sheets_client._status_code(e)
+        reason = type(e).__name__ + (f", HTTP {status}" if status else "")
+        hint = " -- 403 usually means the Drive API is not enabled for the service account's project" \
+            if status == 403 else ""
+        print(f"DRY RUN: the service account can edit this sheet: unknown ({reason}){hint}")
         return
     if can_edit:
         print("DRY RUN: the service account can edit this sheet: yes")
@@ -480,9 +485,10 @@ def report_edit_access(client, spreadsheet_id):
 def main():
     league = LEAGUE
     dry_run = dry_run_enabled()
-    if not league.spreadsheet_id:
-        raise SystemExit(f"{league.name}: no sheet ID is configured -- stopping before anything "
-                         f"is fetched or opened. See leagues.py.")
+    problem = leagues.sheet_problem(league)
+    if problem:
+        raise SystemExit(f"{league.name}: {problem} -- stopping before anything is fetched "
+                         f"or opened. See leagues.py.")
     print(f"=== {league.name} live play by play ===")
     if dry_run:
         print("DRY RUN: reading as usual; nothing will be written and nothing dispatched.")
@@ -711,5 +717,23 @@ def main():
     print("Done.")
 
 
+def run():
+    """main(), with every sheet ID kept out of a crash's traceback.
+
+    This repo's Actions logs are public. A Sheets error names the request's
+    URL, and the URL holds the sheet ID. An ID that came from a secret is
+    masked by GitHub only when it is printed exactly as stored; this does
+    not depend on that. The exit code is 1, as an uncaught error's always was."""
+    try:
+        main()
+    except Exception:
+        text = traceback.format_exc()
+        for league in (LEAGUE, *leagues.ALL):
+            if league.spreadsheet_id:
+                text = text.replace(league.spreadsheet_id, "<sheet>")
+        sys.stderr.write(text)
+        raise SystemExit(1)
+
+
 if __name__ == "__main__":
-    main()
+    run()

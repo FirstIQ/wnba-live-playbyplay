@@ -95,7 +95,7 @@ cold-start path, not an hourly dependency.
 | Secret | Required? | What it does |
 |---|---|---|
 | `GOOGLE_CREDENTIALS_JSON` | **Yes** | Service account JSON. The account needs **Editor** on both tracker sheets; a dry run reports whether it has it. Without the secret the run fails. |
-| `NBA_SPREADSHEET_ID` | **Yes, for the NBA** | The NBA tracker sheet's ID. It is not written in `leagues.py` (see the note there). Without it every NBA poll stops with "no sheet ID is configured" and the run ends red; the WNBA is unaffected. |
+| `NBA_SPREADSHEET_ID` | **Yes, for the NBA** | The NBA tracker sheet's ID. It is not written in `leagues.py` (see the note there). The ID alone, not the sheet's URL, with no spaces or line breaks. Without it (or if it is malformed, or is the WNBA sheet's) every NBA poll stops before it opens anything and the run ends red; the WNBA is unaffected. |
 | `SELF_DISPATCH_TOKEN` | Strongly recommended | Lets a run hand off to its successor. Without it, coverage ends whenever the ~265-minute loop cap is hit and nothing restarts until a scheduled firing actually lands. |
 | `MAIN_PIPELINE_DISPATCH_TOKEN` | Optional | Dispatches the private pipeline's `intraday-updates.yml` (post-tip) and `live-grading.yml` (once both teams have scored). Also used as a fallback for the handoff if `SELF_DISPATCH_TOKEN` is unset. |
 

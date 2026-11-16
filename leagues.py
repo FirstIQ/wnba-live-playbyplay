@@ -25,7 +25,8 @@ module docstring. If a team is added or renamed there, change it here too.
 """
 
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Mapping
 
@@ -37,7 +38,9 @@ DEFAULT_LEAGUE = "wnba"
 class League:
     key: str    # what FIRSTIQ_LEAGUE says
     name: str   # what the logs say
-    spreadsheet_id: str
+    # Kept out of repr(): this repo's Actions logs are public, and a league
+    # that ends up in an error message must not bring its sheet ID along.
+    spreadsheet_id: str = field(repr=False)
     # ESPN spells the league in two places: the site API path
     # (basketball/<x>) and the core API's leagues/<x>. They happen to
     # match for both leagues, but they are different hosts, so they are
@@ -95,8 +98,10 @@ NBA = _league(
     # their ID, and this repo is public, so the NBA sheet's ID waits for
     # the owner's say. Until then it comes from the environment (the
     # NBA_SPREADSHEET_ID secret in live-playbyplay.yml); with neither, an
-    # NBA run stops before it fetches or opens anything.
-    spreadsheet_id=os.environ.get("NBA_SPREADSHEET_ID", "").strip(),
+    # NBA run stops before it fetches or opens anything -- see sheet_problem().
+    # Taken exactly as given, never trimmed: GitHub masks a secret in the
+    # logs by its exact value, so a tidied copy would print unmasked.
+    spreadsheet_id=os.environ.get("NBA_SPREADSHEET_ID", ""),
     sport_path="basketball/nba",
     league_slug="nba",
     # 12-minute quarters: 180-540 seconds left is 3-9 minutes in. The
@@ -127,6 +132,29 @@ NBA = _league(
 # The order one poll cycle works through them in.
 ALL = (WNBA, NBA)
 _BY_KEY = {league.key: league for league in ALL}
+
+# What a Google Sheets ID looks like. A pasted browser URL, or an ID with a
+# stray space or newline, is not one.
+_SHEET_ID = re.compile(r"[A-Za-z0-9_-]{25,}")
+
+
+def sheet_problem(league):
+    """Why this league's sheet must not be opened, or None if it may be.
+
+    Checked by the watcher before it fetches or opens anything. It never
+    echoes the ID. The third check is the one that matters most: FIRSTIQ_LEAGUE
+    refuses a typo, but a sheet ID that arrives from the environment could
+    still be ANOTHER league's sheet, and then one league's plays are written
+    into the other's tabs with nothing to notice."""
+    if not league.spreadsheet_id:
+        return "no sheet ID is configured"
+    if not _SHEET_ID.fullmatch(league.spreadsheet_id):
+        return ("its sheet ID is not a sheet ID -- it must be the ID alone, not the sheet's URL, "
+                "with no spaces or line breaks")
+    if any(other is not league and other.key != league.key and other.spreadsheet_id == league.spreadsheet_id
+           for other in ALL):
+        return "its sheet ID is another league's sheet"
+    return None
 
 
 def resolve(name=None):

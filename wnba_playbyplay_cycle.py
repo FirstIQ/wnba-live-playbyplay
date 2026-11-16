@@ -45,7 +45,15 @@ import leagues
 import wnba_playbyplay_gate as gate
 import wnba_playbyplay_live as live
 
-WATCHER = "wnba_playbyplay_live.py"
+# Beside this file, wherever the job's working directory is.
+WATCHER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wnba_playbyplay_live.py")
+
+# A poll normally takes well under a minute. The Sheets client has no
+# timeout of its own, so without a ceiling one hung request would hold the
+# other league (and the whole loop) until the job's 300-minute limit, which
+# also skips the hand-off. 15 minutes is far past a poll that is merely slow:
+# every request retrying its full backoff (sheets.py) still finishes inside it.
+POLL_TIMEOUT_SECONDS = 900
 
 
 def any_league_relevant():
@@ -73,9 +81,14 @@ def poll():
             code = subprocess.run(
                 [sys.executable, WATCHER],
                 env={**os.environ, leagues.ENV_VAR: league.key},
+                timeout=POLL_TIMEOUT_SECONDS,
             ).returncode
+        except subprocess.TimeoutExpired:
+            print(f"The {league.name} poll was stopped after {POLL_TIMEOUT_SECONDS}s without finishing. "
+                  f"If it was mid-rewrite, check the 'Play By Play' tab.")
+            code = 1
         except Exception as e:
-            print(f"Could not start the {league.name} poll: {e}")
+            print(f"Could not start the {league.name} poll: {type(e).__name__}")
             code = 1
         if code != 0:
             failed.append(league.name)
