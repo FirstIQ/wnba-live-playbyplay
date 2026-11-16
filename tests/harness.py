@@ -20,6 +20,9 @@ NOW = datetime(2026, 9, 17, 19, 12, 5, tzinfo=ZoneInfo("America/New_York"))
 TODAY = "2026-09-17"
 STAMP = "2026-09-17 19:12:05"
 
+# What Sheets runs as a formula when a cell is written USER_ENTERED.
+FORMULA_STARTS = ("=", "+", "-", "@")
+
 
 class FrozenDatetime(datetime):
     @classmethod
@@ -38,6 +41,7 @@ class FakeWorksheet:
         self.values = [list(r) for r in values]
         self.row_count = row_count
         self.ops = []
+        self.formulas = []  # cells Sheets would have run instead of storing
         self.fail_on = None  # an op name that raises instead of running
 
     @property
@@ -48,13 +52,30 @@ class FakeWorksheet:
         self.ops.append("get_all_values")
         return [list(r) for r in self.values]
 
+    def _typed(self, row, value_input_option):
+        """The row as Sheets keeps it. USER_ENTERED reads a string as if it
+        were typed into the cell: a leading apostrophe means "this is text"
+        and is not kept, and a leading = + - or @ makes the cell a formula.
+        The fake does not run formulas; it lists them in `formulas`. RAW
+        stores every value as it was sent."""
+        if value_input_option != "USER_ENTERED":
+            return list(row)
+        kept = []
+        for cell in row:
+            if isinstance(cell, str) and cell.startswith("'"):
+                cell = cell[1:]
+            elif isinstance(cell, str) and cell.startswith(FORMULA_STARTS):
+                self.formulas.append(cell)
+            kept.append(cell)
+        return kept
+
     def append_row(self, row, value_input_option=None):
         self.ops.append("append_row")
-        self.values.append(list(row))
+        self.values.append(self._typed(row, value_input_option))
 
     def append_rows(self, rows, value_input_option=None):
         self.ops.append("append_rows")
-        self.values.extend(list(r) for r in rows)
+        self.values.extend(self._typed(r, value_input_option) for r in rows)
 
     def _maybe_fail(self, op):
         if self.fail_on == op:
@@ -79,7 +100,7 @@ class FakeWorksheet:
         while len(self.values) < first + len(values):
             self.values.append([])
         for offset, row in enumerate(values):
-            self.values[first + offset] = list(row)
+            self.values[first + offset] = self._typed(row, value_input_option)
 
 
 class FakeSpreadsheet:
