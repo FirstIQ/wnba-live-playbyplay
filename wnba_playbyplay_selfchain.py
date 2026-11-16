@@ -1,5 +1,5 @@
 """
-WNBA LIVE PLAY BY PLAY -- SELF-CHAIN HANDOFF
+LIVE PLAY BY PLAY -- SELF-CHAIN HANDOFF
 ----------------------------------------------------------------------------
 Starts a fresh run of this same workflow when the current one is about to
 end while games are still live.
@@ -30,6 +30,14 @@ built-in GITHUB_TOKEN cannot be used: GitHub deliberately refuses to start a
 new workflow run from an event raised with it, precisely to prevent the kind
 of recursion this script does on purpose. With no usable token the script
 just no-ops and the cron remains the only trigger.
+
+BOTH LEAGUES, ONE SUCCESSOR. The run being handed off covers every league
+in leagues.py, so this looks at each league's slate and starts exactly one
+fresh run if any of them still has a game on. One league's scoreboard
+failing counts as "no" for that league only -- still fail-closed, but an
+ESPN error on the WNBA feed in November must not end NBA coverage.
+
+In a dry run (FIRSTIQ_DRY_RUN) it starts nothing.
 """
 
 import os
@@ -37,32 +45,42 @@ from datetime import datetime, timezone
 
 from curl_cffi import requests
 
+import leagues
+import wnba_playbyplay_live as live
 from wnba_playbyplay_gate import _game_is_relevant_now
-from wnba_playbyplay_live import get_todays_events
 
 THIS_REPO = "FirstIQ/wnba-live-playbyplay"
 THIS_WORKFLOW = "live-playbyplay.yml"
 BRANCH = "master"
 
 
-def should_hand_off():
-    """True only if we're confident a game still needs covering. Any doubt
-    (fetch failure, unexpected shape) means don't chain -- see module docs."""
+def league_needs_cover(league):
+    """True only if we're confident one of this league's games still needs
+    covering. Any doubt (fetch failure, unexpected shape) means no -- see
+    module docs."""
     now_utc = datetime.now(timezone.utc)
     try:
-        for event in get_todays_events():
+        for event in live.get_todays_events(league):
             if event.get("season", {}).get("slug") != "regular-season":
                 continue
-            if _game_is_relevant_now(event, now_utc):
+            if _game_is_relevant_now(event, now_utc, league):
                 return True
         return False
     except Exception as e:
-        print(f"Couldn't confirm the slate is still live ({e}) -- not chaining; "
+        print(f"Couldn't confirm the {league.name} slate is still live ({e}) -- not chaining for it; "
               "the scheduled run is the backstop.")
         return False
 
 
+def should_hand_off():
+    """True if any league still has a game to cover."""
+    return any(league_needs_cover(league) for league in leagues.ALL)
+
+
 def dispatch_self(token):
+    if live.dry_run_enabled():
+        print("    DRY RUN: not starting a fresh run.")
+        return False
     url = f"https://api.github.com/repos/{THIS_REPO}/actions/workflows/{THIS_WORKFLOW}/dispatches"
     try:
         resp = requests.post(
@@ -86,6 +104,9 @@ def dispatch_self(token):
 
 
 def main():
+    if live.dry_run_enabled():
+        print("DRY RUN: no handoff -- a dry run starts nothing.")
+        return
     token = os.environ.get("SELF_DISPATCH_TOKEN") or os.environ.get("MAIN_PIPELINE_DISPATCH_TOKEN")
     if not token:
         print("No self-dispatch token set -- skipping handoff. "

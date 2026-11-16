@@ -1,6 +1,12 @@
 """
-WNBA FIRST BASKET TRACKER -- LIVE PLAY BY PLAY (opening plays, real-time)
+FIRST BASKET TRACKER -- LIVE PLAY BY PLAY (opening plays, real-time)
 ----------------------------------------------------------------------------
+One league per run: the WNBA by default, the NBA with FIRSTIQ_LEAGUE=nba.
+Everything that differs between them (sheet, ESPN feed, teams, post-tip
+window) is in leagues.py; the file name is historical. live-playbyplay.yml
+runs both leagues each cycle, one after the other, through
+wnba_playbyplay_cycle.py.
+
 The main pipeline (a separate, private repo) only captures a game's
 opening plays once it's logged the ENTIRE game as final -- that can be
 1-2+ hours after the first basket itself actually happened.
@@ -45,13 +51,21 @@ picks/injury status stale for up to ~2 hours right after a game actually
 tips off. Requires a MAIN_PIPELINE_DISPATCH_TOKEN secret (a GitHub token
 with permission to dispatch workflows on the private pipeline repo); if
 that secret isn't set, this feature just quietly no-ops.
+
+DRY RUN: with FIRSTIQ_DRY_RUN set (or --dry-run), a poll reads the sheet
+and ESPN exactly as usual, prints every row it would write and every
+dispatch it would send, and writes and dispatches nothing. See
+dry_run_enabled().
 """
 
 import os
+import sys
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import gspread
+import leagues
 import sheets as sheets_client
 from curl_cffi import requests
 from google.oauth2.service_account import Credentials
@@ -63,28 +77,21 @@ from tenacity import (
 )
 
 CREDENTIALS_PATH = os.environ.get("GOOGLE_CREDENTIALS_PATH", "gcreds.json")
-SPREADSHEET_ID = "1cHokxmusavnAfYr0DqJkNSWZ7Eb8_74L5YGAdleGAuQ"
 PBP_SHEET_NAME = "Play By Play"
-SPORT_PATH = "basketball/wnba"
 LOCAL_TZ = ZoneInfo("America/New_York")
 
-# Same filter the main pipeline uses to keep All-Star/exhibition games out
-# of anything real -- duplicated here since this repo is intentionally
-# self-contained and independent of the main pipeline's codebase.
-REAL_TEAMS = {
-    "Las Vegas Aces", "New York Liberty", "Connecticut Sun", "Indiana Fever",
-    "Chicago Sky", "Atlanta Dream", "Washington Mystics", "Minnesota Lynx",
-    "Phoenix Mercury", "Los Angeles Sparks", "Seattle Storm", "Dallas Wings",
-    "Golden State Valkyries", "Toronto Tempo", "Portland Fire",
-}
+# Which league this process works on: its sheet, its ESPN feed, its real
+# teams and their codes, its post-tip window. Resolved once, here, from
+# FIRSTIQ_LEAGUE; an unknown value raises and the run stops. See leagues.py.
+LEAGUE = leagues.resolve()
 
-TEAM_ABBR = {
-    "Las Vegas Aces": "LVA", "New York Liberty": "NYL", "Connecticut Sun": "CON",
-    "Indiana Fever": "IN", "Chicago Sky": "CHI", "Atlanta Dream": "ATL",
-    "Washington Mystics": "WAS", "Minnesota Lynx": "MIN", "Phoenix Mercury": "PHX",
-    "Los Angeles Sparks": "LA", "Seattle Storm": "SEA", "Dallas Wings": "DAL",
-    "Golden State Valkyries": "GSV", "Toronto Tempo": "TOR", "Portland Fire": "POR",
-}
+WRITE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+# A dry run asks Google for a token that cannot write at all.
+READ_ONLY_SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly",
+                    "https://www.googleapis.com/auth/drive.readonly"]
+
+DRY_RUN_ENV_VAR = "FIRSTIQ_DRY_RUN"
+_DRY_RUN_OFF = {"", "0", "false", "no", "off"}
 
 PBP_HEADER = ["Event ID", "Date", "Matchup", "Period", "Clock", "Seconds Remaining", "Team",
               "Away Score", "Home Score", "Play", "Scoring Play (Y/N)"]
@@ -114,14 +121,22 @@ DISPATCH_LOG_HEADER = ["Event ID", "Date", "Matchup", "Dispatched At"]
 # two dispatches dedupe independently -- a game fires each exactly once.
 MAIN_PIPELINE_GRADING_WORKFLOW = "live-grading.yml"
 GRADING_DISPATCH_LOG_SHEET_NAME = "Live Grading Dispatch Log"
-# Widened past a single instant to reliably catch it despite 5-minute
-# polling -- WNBA quarters are 10 minutes, so this is elapsed game time of
-# roughly 3-9 minutes into Q1.
-POST_TIP_WINDOW_SECONDS_REMAINING = (60, 420)
 
 # Simple in-run cache -- same athlete can be the first-basket scorer looked
 # up at most once per run anyway, but avoids re-hitting ESPN if it ever is.
+# Keyed by league as well: ESPN numbers each league's athletes separately.
 _athlete_cache = {}
+
+
+def dry_run_enabled(argv=None):
+    """True when this run must write nothing and dispatch nothing.
+
+    On with --dry-run, or with FIRSTIQ_DRY_RUN set to anything that is not
+    plainly "off". An unreadable value counts as ON: a misread switch has
+    to fail toward not writing to the production sheet."""
+    if "--dry-run" in (sys.argv[1:] if argv is None else argv):
+        return True
+    return os.environ.get(DRY_RUN_ENV_VAR, "").strip().lower() not in _DRY_RUN_OFF
 
 
 def _is_retryable(exc):
@@ -156,11 +171,11 @@ def get_player(athlete_id):
     """Resolves an athlete ID to name/position via ESPN's athlete endpoint --
     same source and shape the main pipeline's own lookup uses, kept
     independent here since this repo is intentionally self-contained."""
-    if athlete_id in _athlete_cache:
-        return _athlete_cache[athlete_id]
-    url = f"https://sports.core.api.espn.com/v2/sports/basketball/leagues/wnba/athletes/{athlete_id}?lang=en&region=us"
+    cache_key = (LEAGUE.key, athlete_id)
+    if cache_key in _athlete_cache:
+        return _athlete_cache[cache_key]
     try:
-        data = _get(url).json()
+        data = _get(LEAGUE.athlete_url(athlete_id)).json()
         name = data.get("fullName") or data.get("displayName") or "UNKNOWN"
         pos = data.get("position", {}).get("abbreviation", "")
         result = {"name": name, "position": pos[0] if pos else ""}
@@ -170,12 +185,12 @@ def get_player(athlete_id):
         # record for the rest of the run. Return None so the caller retries
         # the whole event on the next poll instead.
         return None
-    _athlete_cache[athlete_id] = result
+    _athlete_cache[cache_key] = result
     return result
 
 
 def get_abbr(full_name, espn_fallback):
-    return TEAM_ABBR.get(full_name, espn_fallback)
+    return LEAGUE.team_abbr.get(full_name, espn_fallback)
 
 
 def parse_clock_to_seconds(display_value):
@@ -252,17 +267,27 @@ def current_period_and_clock(event):
 
 
 def is_a_few_minutes_into_first_quarter(event):
+    """Inside the league's post-tip window: three to nine minutes into Q1,
+    wide enough to be caught by a 5-minute poll. The window is in seconds
+    LEFT on the clock, so it differs by quarter length (leagues.py)."""
     period, seconds_remaining = current_period_and_clock(event)
     if period != 1 or seconds_remaining is None:
         return False
-    low, high = POST_TIP_WINDOW_SECONDS_REMAINING
+    low, high = LEAGUE.post_tip_window
     return low <= seconds_remaining <= high
 
 
 def trigger_main_pipeline_workflow(token, workflow):
     """Fires a workflow_dispatch on one of the main (private) pipeline
     repo's workflows. Returns True on success; never raises, so a
-    dispatch failure never takes down this run's actual play-by-play work."""
+    dispatch failure never takes down this run's actual play-by-play work.
+
+    Both of the pipeline's workflows run every league, so the same dispatch
+    serves whichever league this run is watching."""
+    if dry_run_enabled():
+        # main() never gets here in a dry run. This is the second lock.
+        print(f"    DRY RUN: not dispatching {workflow}.")
+        return False
     url = f"https://api.github.com/repos/{MAIN_PIPELINE_REPO}/actions/workflows/{workflow}/dispatches"
     try:
         resp = requests.post(
@@ -281,13 +306,14 @@ def trigger_main_pipeline_workflow(token, workflow):
         return False
 
 
-def get_todays_events():
+def get_todays_events(league=None):
+    """Today's scoreboard for `league` (default: this run's league). The
+    gate and the self-chain pass a league to look at each one in turn."""
     # datetime.now() is naive and reads UTC on GitHub Actions runners --
     # between 8pm-midnight ET, UTC has already rolled to the next calendar
     # date, which would silently pull tomorrow's slate instead of today's.
     target_str = datetime.now(LOCAL_TZ).strftime("%Y%m%d")
-    url = f"https://site.api.espn.com/apis/site/v2/sports/{SPORT_PATH}/scoreboard?dates={target_str}"
-    return _get(url).json().get("events", [])
+    return _get((league or LEAGUE).scoreboard_url(target_str)).json().get("events", [])
 
 
 def format_shot_method(type_text, points):
@@ -353,8 +379,7 @@ def fetch_game_data(event_id):
     point) -- see the module docstring for why this isn't a fixed time
     window. first_basket is the resolved scorer of the game's actual first
     basket (see find_first_basket), independent of that per-team cutoff."""
-    url = f"https://site.api.espn.com/apis/site/v2/sports/{SPORT_PATH}/summary?event={event_id}"
-    data = _get(url).json()
+    data = _get(LEAGUE.summary_url(event_id)).json()
     if "plays" not in data:
         raise ValueError(f"Event {event_id}: summary response has no 'plays' key -- ESPN response shape may have changed.")
     plays = data["plays"]
@@ -405,10 +430,15 @@ def fetch_game_data(event_id):
     return rows, fully_captured, first_basket
 
 
-def get_or_create_tab(spreadsheet, sheet_name, header):
+def get_or_create_tab(spreadsheet, sheet_name, header, dry_run=False):
+    """The tab, created with its header if it is missing. A dry run creates
+    nothing: it says so and returns None, which reads as an empty tab."""
     try:
         return spreadsheet.worksheet(sheet_name)
     except gspread.WorksheetNotFound:
+        if dry_run:
+            print(f"DRY RUN: would create the '{sheet_name}' tab, which doesn't exist yet.")
+            return None
         print(f"'{sheet_name}' tab doesn't exist yet -- creating it.")
         ws = spreadsheet.add_worksheet(title=sheet_name, rows=2000, cols=len(header))
         # Keyword form: gspread has swapped this argument order once
@@ -419,45 +449,75 @@ def get_or_create_tab(spreadsheet, sheet_name, header):
         return ws
 
 
+def data_rows(ws):
+    """Every row under the header. An empty tab, or one a dry run did not
+    create, has none."""
+    return ws.get_all_values()[1:] if ws is not None else []
+
+
+def report_edit_access(client, spreadsheet_id):
+    """Dry run only: asks Drive whether this service account could have
+    written to the sheet, so a missing Editor share shows up here and not
+    as a failed first write on a game night. One read; changes nothing."""
+    try:
+        response = client.http_client.request(
+            "get", f"https://www.googleapis.com/drive/v3/files/{spreadsheet_id}",
+            params={"fields": "capabilities(canEdit)", "supportsAllDrives": "true"})
+        can_edit = response.json()["capabilities"]["canEdit"]
+    except Exception as e:
+        # Never echo the sheet ID: this repo's Actions logs are public,
+        # and Drive's error text names the file.
+        reason = f"{type(e).__name__}: {e}".replace(spreadsheet_id, "<sheet>")
+        print(f"DRY RUN: the service account can edit this sheet: unknown ({reason})")
+        return
+    if can_edit:
+        print("DRY RUN: the service account can edit this sheet: yes")
+    else:
+        print("DRY RUN: the service account can edit this sheet: NO -- a real run would fail on its "
+              "first write. Share the sheet with the service account as Editor.")
+
+
 def main():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_file(CREDENTIALS_PATH, scopes=scopes)
+    league = LEAGUE
+    dry_run = dry_run_enabled()
+    if not league.spreadsheet_id:
+        raise SystemExit(f"{league.name}: no sheet ID is configured -- stopping before anything "
+                         f"is fetched or opened. See leagues.py.")
+    print(f"=== {league.name} live play by play ===")
+    if dry_run:
+        print("DRY RUN: reading as usual; nothing will be written and nothing dispatched.")
+
+    creds = Credentials.from_service_account_file(
+        CREDENTIALS_PATH, scopes=READ_ONLY_SCOPES if dry_run else WRITE_SCOPES)
     # sheets_client.authorize(), not gspread.authorize(): this script is
     # the heaviest Sheets consumer in the system (a poll every 5 minutes,
     # four full-tab reads and a whole-tab rewrite each time) and shares one
     # service account -- and therefore one per-minute quota -- with the main
     # pipeline. Bare gspread turns a 429 into a dead run. See sheets.py.
-    client = sheets_client.authorize(creds)
-    spreadsheet = client.open_by_key(SPREADSHEET_ID)
+    # In a dry run the client also refuses to send anything but a read.
+    client = sheets_client.authorize(creds, read_only=dry_run)
+    spreadsheet = client.open_by_key(league.spreadsheet_id)
+    if dry_run:
+        report_edit_access(client, league.spreadsheet_id)
 
     print("Checking today's scoreboard for live/finished games...")
     events = get_todays_events()
 
-    pbp_ws = get_or_create_tab(spreadsheet, PBP_SHEET_NAME, PBP_HEADER)
-    existing_values = pbp_ws.get_all_values()
-    if not existing_values:
-        existing_values = [PBP_HEADER]
-    existing_rows = existing_values[1:]
+    pbp_ws = get_or_create_tab(spreadsheet, PBP_SHEET_NAME, PBP_HEADER, dry_run)
+    existing_rows = data_rows(pbp_ws)
 
-    fb_ws = get_or_create_tab(spreadsheet, FB_SHEET_NAME, FB_HEADER)
-    fb_existing_values = fb_ws.get_all_values()
-    if not fb_existing_values:
-        fb_existing_values = [FB_HEADER]
-    fb_existing_rows = fb_existing_values[1:]
-    fb_known_event_ids = {r[0] for r in fb_existing_rows if r}
+    fb_ws = get_or_create_tab(spreadsheet, FB_SHEET_NAME, FB_HEADER, dry_run)
+    fb_known_event_ids = {r[0] for r in data_rows(fb_ws) if r}
 
     dispatch_token = os.environ.get("MAIN_PIPELINE_DISPATCH_TOKEN")
-    dispatch_ws = get_or_create_tab(spreadsheet, DISPATCH_LOG_SHEET_NAME, DISPATCH_LOG_HEADER)
-    dispatch_existing_values = dispatch_ws.get_all_values()
-    if not dispatch_existing_values:
-        dispatch_existing_values = [DISPATCH_LOG_HEADER]
-    dispatched_event_ids = {r[0] for r in dispatch_existing_values[1:] if r}
+    # A dry run reports the dispatches a real run would send, whether or
+    # not it was handed the token (the workflow's dry-run step is not).
+    can_dispatch = bool(dispatch_token) or dry_run
+    dispatch_ws = get_or_create_tab(spreadsheet, DISPATCH_LOG_SHEET_NAME, DISPATCH_LOG_HEADER, dry_run)
+    dispatched_event_ids = {r[0] for r in data_rows(dispatch_ws) if r}
 
-    grading_dispatch_ws = get_or_create_tab(spreadsheet, GRADING_DISPATCH_LOG_SHEET_NAME, DISPATCH_LOG_HEADER)
-    grading_dispatch_values = grading_dispatch_ws.get_all_values()
-    if not grading_dispatch_values:
-        grading_dispatch_values = [DISPATCH_LOG_HEADER]
-    grading_dispatched_event_ids = {r[0] for r in grading_dispatch_values[1:] if r}
+    grading_dispatch_ws = get_or_create_tab(spreadsheet, GRADING_DISPATCH_LOG_SHEET_NAME, DISPATCH_LOG_HEADER, dry_run)
+    grading_dispatched_event_ids = {r[0] for r in data_rows(grading_dispatch_ws) if r}
 
     updates = {}  # event_id -> new_rows, only for events actually re-fetched
     fb_new_rows = []  # newly-identified first baskets this run
@@ -476,7 +536,7 @@ def main():
 
         competitors = event["competitions"][0]["competitors"]
         team_names = {c["team"]["displayName"] for c in competitors}
-        if not team_names.issubset(REAL_TEAMS):
+        if not team_names.issubset(league.real_teams):
             continue
 
         home_c = next(c for c in competitors if c["homeAway"] == "home")["team"]
@@ -487,20 +547,25 @@ def main():
         event_id = event["id"]
 
         if (
-            dispatch_token
+            can_dispatch
             and event_id not in dispatched_event_ids
             and is_a_few_minutes_into_first_quarter(event)
         ):
-            print(f"  {matchup} is a few minutes into Q1 -- triggering an early intraday pipeline refresh...")
-            if trigger_main_pipeline_workflow(dispatch_token, MAIN_PIPELINE_INTRADAY_WORKFLOW):
-                # Log immediately, before doing anything else that could fail --
-                # otherwise a later exception this run leaves the dispatch fired
-                # but unrecorded, and the next run fires it again.
-                dispatch_ws.append_row([event_id, today_str, matchup, now_str], value_input_option="USER_ENTERED")
-                dispatched_event_ids.add(event_id)
-                print("    Triggered and logged.")
+            dispatch_row = [event_id, today_str, matchup, now_str]
+            if dry_run:
+                print(f"  DRY RUN: {matchup} is a few minutes into Q1 -- would dispatch "
+                      f"{MAIN_PIPELINE_INTRADAY_WORKFLOW} and log {dispatch_row} to '{DISPATCH_LOG_SHEET_NAME}'.")
             else:
-                print("    Dispatch failed -- will retry next run.")
+                print(f"  {matchup} is a few minutes into Q1 -- triggering an early intraday pipeline refresh...")
+                if trigger_main_pipeline_workflow(dispatch_token, MAIN_PIPELINE_INTRADAY_WORKFLOW):
+                    # Log immediately, before doing anything else that could fail --
+                    # otherwise a later exception this run leaves the dispatch fired
+                    # but unrecorded, and the next run fires it again.
+                    dispatch_ws.append_row(dispatch_row, value_input_option="USER_ENTERED")
+                    dispatched_event_ids.add(event_id)
+                    print("    Triggered and logged.")
+                else:
+                    print("    Dispatch failed -- will retry next run.")
 
         rows_for_event = [r for r in existing_rows if r and r[0] == event_id]
         if rows_for_event and event_already_captured(rows_for_event):
@@ -509,7 +574,7 @@ def main():
             # captured before live grading existed), fire it now. The
             # plays are already on the sheet, so the grader has what it
             # needs immediately.
-            if dispatch_token and event_id not in grading_dispatched_event_ids:
+            if can_dispatch and event_id not in grading_dispatched_event_ids:
                 grade_ready.append((event_id, matchup))
             continue
 
@@ -544,10 +609,14 @@ def main():
         # plays it needs are only written to the sheet at the end of this
         # run, and dispatching first would race the grader against data
         # that isn't there yet.
-        if fully_captured and dispatch_token and event_id not in grading_dispatched_event_ids:
+        if fully_captured and can_dispatch and event_id not in grading_dispatched_event_ids:
             grade_ready.append((event_id, matchup))
 
-    if fb_new_rows:
+    if fb_new_rows and dry_run:
+        print(f"DRY RUN: would append {len(fb_new_rows)} row(s) to '{FB_SHEET_NAME}':")
+        for row in fb_new_rows:
+            print(f"    {row}")
+    elif fb_new_rows:
         print(f"Writing Live First Basket: {len(fb_new_rows)} new game(s).")
         fb_ws.append_rows(fb_new_rows, value_input_option="USER_ENTERED")
 
@@ -573,8 +642,7 @@ def main():
         #
         # Re-reading immediately before the write is what makes the window
         # small enough not to matter, rather than relying on the schedule.
-        current_values = pbp_ws.get_all_values()
-        current_rows = current_values[1:] if current_values else []
+        current_rows = data_rows(pbp_ws)
 
         appeared = len(current_rows) - len(existing_rows)
         if appeared > 0:
@@ -584,22 +652,38 @@ def main():
 
         kept_rows = [r for r in current_rows if r and r[0] not in updates]
         all_rows = kept_rows + [row for rows in updates.values() for row in rows]
+        counts = (f"{len(all_rows)} data row(s) ({len(kept_rows)} kept, "
+                  f"{len(all_rows) - len(kept_rows)} for {len(updates)} updated game(s))")
 
-        print(f"Writing Play By Play: {len(kept_rows)} untouched row(s) kept, {len(updates)} game(s) updated.")
-        pbp_ws.clear()
-        pbp_ws.update(range_name="A1", values=[PBP_HEADER], value_input_option="USER_ENTERED")
-        if all_rows:
-            pbp_ws.update(range_name=f"A2:K{len(all_rows) + 1}", values=all_rows, value_input_option="RAW")
+        if dry_run:
+            print(f"DRY RUN: would rewrite '{PBP_SHEET_NAME}': {counts}. The new rows:")
+            for row in all_rows[len(kept_rows):]:
+                print(f"    {row}")
+        else:
+            print(f"Writing Play By Play: {len(kept_rows)} untouched row(s) kept, {len(updates)} game(s) updated.")
+            started = time.monotonic()
+            pbp_ws.clear()
+            pbp_ws.update(range_name="A1", values=[PBP_HEADER], value_input_option="USER_ENTERED")
+            if all_rows:
+                pbp_ws.update(range_name=f"A2:K{len(all_rows) + 1}", values=all_rows, value_input_option="RAW")
+            refilled = time.monotonic()
 
-        # Assert the rewrite did what it claimed. A clear() that succeeded
-        # followed by an update() that partially failed leaves the tab
-        # truncated, and every consumer downstream reads that as "these
-        # games have no plays" rather than as an error.
-        written = len(pbp_ws.get_all_values()) - 1
-        if written != len(all_rows):
-            print(f"  WARNING: expected {len(all_rows)} data row(s) in '{PBP_SHEET_NAME}' "
-                  f"after the rewrite, found {written}. The tab may be truncated -- "
-                  f"the next poll will rebuild it, but check before trusting live grading.")
+            # Assert the rewrite did what it claimed. A clear() that succeeded
+            # followed by an update() that partially failed leaves the tab
+            # truncated, and every consumer downstream reads that as "these
+            # games have no plays" rather than as an error.
+            written = len(pbp_ws.get_all_values()) - 1
+
+            # One line per league per rewrite, to measure it: the tab is
+            # empty or partial from clear() until the rows land, the app
+            # reads it, and the NBA brings about 4x the WNBA's games.
+            print(f"Play By Play rewrite [{league.key}]: wrote {counts}; read back {written}; "
+                  f"tab empty or partial for {refilled - started:.2f}s, "
+                  f"{time.monotonic() - started:.2f}s in all.")
+            if written != len(all_rows):
+                print(f"  WARNING: expected {len(all_rows)} data row(s) in '{PBP_SHEET_NAME}' "
+                      f"after the rewrite, found {written}. The tab may be truncated -- "
+                      f"the next poll will rebuild it, but check before trusting live grading.")
     else:
         print("No new plays to write.")
 
@@ -609,16 +693,20 @@ def main():
     # so firing it once per run is enough no matter how many games landed.
     if grade_ready:
         names = ", ".join(m for _, m in grade_ready)
-        print(f"Opening decided for {names} -- triggering live grading...")
-        if trigger_main_pipeline_workflow(dispatch_token, MAIN_PIPELINE_GRADING_WORKFLOW):
-            grading_dispatch_ws.append_rows(
-                [[event_id, today_str, matchup, now_str] for event_id, matchup in grade_ready],
-                value_input_option="USER_ENTERED",
-            )
-            print("    Triggered and logged.")
+        grading_rows = [[event_id, today_str, matchup, now_str] for event_id, matchup in grade_ready]
+        if dry_run:
+            print(f"DRY RUN: opening decided for {names} -- would dispatch {MAIN_PIPELINE_GRADING_WORKFLOW} "
+                  f"and log {len(grading_rows)} row(s) to '{GRADING_DISPATCH_LOG_SHEET_NAME}':")
+            for row in grading_rows:
+                print(f"    {row}")
         else:
-            print("    Grading dispatch failed -- will retry next run "
-                  "(the scheduled live-grading run is the backstop).")
+            print(f"Opening decided for {names} -- triggering live grading...")
+            if trigger_main_pipeline_workflow(dispatch_token, MAIN_PIPELINE_GRADING_WORKFLOW):
+                grading_dispatch_ws.append_rows(grading_rows, value_input_option="USER_ENTERED")
+                print("    Triggered and logged.")
+            else:
+                print("    Grading dispatch failed -- will retry next run "
+                      "(the scheduled live-grading run is the backstop).")
 
     print("Done.")
 
