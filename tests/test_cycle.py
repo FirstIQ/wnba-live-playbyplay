@@ -15,6 +15,7 @@ import sys
 from unittest import mock
 
 import pytest
+import yaml
 
 import leagues
 import wnba_playbyplay_cycle as cycle
@@ -120,7 +121,8 @@ class TestPoll:
         relevant(monkeypatch, wnba=True, nba=True)
         cycle.poll()
         assert [c["timeout"] for c in calls] == [cycle.POLL_TIMEOUT_SECONDS] * 2
-        assert 300 < cycle.POLL_TIMEOUT_SECONDS <= 900
+        # Past a poll whose every request retries its full backoff (13 x ~75s).
+        assert cycle.POLL_TIMEOUT_SECONDS > 13 * 80
 
     def test_a_league_with_no_game_on_is_not_polled(self, monkeypatch, runs):
         """Four full-tab reads a poll, on a quota shared with bball-bots."""
@@ -130,7 +132,7 @@ class TestPoll:
         assert [c["league"] for c in calls] == ["nba"]
 
     @pytest.mark.parametrize("failure", [
-        1, OSError("could not start"), subprocess.TimeoutExpired("watcher", 900)])
+        1, OSError("could not start"), subprocess.TimeoutExpired("watcher", 1200)])
     def test_one_league_failing_does_not_stop_the_other(self, monkeypatch, runs, failure, capsys):
         calls, codes = runs
         codes["wnba"] = failure
@@ -193,21 +195,71 @@ class TestHandoff:
 
 
 class TestWorkflow:
-    """The loop lives in YAML, which no test can run. These pin the three
-    things that would silently undo the above."""
+    """The loop lives in YAML, which no test can run. These pin, exactly,
+    the conditions that keep a dry run from writing, keep real runs in one
+    writing group, and keep a red loop from costing the slate its successor.
+    Each was checked by breaking it and watching the looser version of this
+    test stay green."""
 
-    text = open(".github/workflows/live-playbyplay.yml", encoding="utf-8").read()
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".github", "workflows",
+                        "live-playbyplay.yml")
+    text = open(path, encoding="utf-8").read()
+    workflow = yaml.safe_load(text)
+    job = workflow["jobs"]["live-pbp"]
+    steps = {step["name"]: step for step in job["steps"] if "name" in step}
+
+    DRY = "Dry run (one pass, writes nothing)"
+    LOOP = "Capture live opening play by play (polls every 5 min, up to ~4.4h)"
+    HANDOFF = "Hand off to a fresh run if games are still live"
+
+    def test_real_runs_share_one_writing_group_and_a_dry_run_has_its_own(self):
+        assert self.workflow["concurrency"] == {
+            "group": "${{ inputs.dry_run && 'live-pbp-dry-run' || 'live-pbp' }}",
+            "cancel-in-progress": False,
+        }
+
+    def test_a_dry_run_never_reaches_the_writing_loop_or_the_handoff(self):
+        assert self.steps[self.DRY]["if"] == "${{ inputs.dry_run }}"
+        assert self.steps[self.LOOP]["if"] == "${{ steps.gate.outcome == 'success' && !inputs.dry_run }}"
+        assert self.steps[self.HANDOFF]["if"] == \
+            "${{ !cancelled() && steps.gate.outcome == 'success' && !inputs.dry_run }}"
+
+    def test_the_dry_run_is_off_unless_asked_for(self):
+        dry_run = self.workflow[True]["workflow_dispatch"]["inputs"]["dry_run"]  # YAML reads `on:` as True
+        assert dry_run["type"] == "boolean" and dry_run["default"] is False
+
+    def test_the_dry_run_step_is_told_to_be_dry_and_is_given_no_dispatch_token(self):
+        assert self.steps[self.DRY]["env"] == {
+            "FIRSTIQ_DRY_RUN": "true",
+            "GOOGLE_CREDENTIALS_PATH": "${{ runner.temp }}/gcreds.json",
+            "NBA_SPREADSHEET_ID": "${{ secrets.NBA_SPREADSHEET_ID }}",
+        }
+        assert self.steps[self.DRY]["run"] == "python wnba_playbyplay_cycle.py poll"
+        # Nor through the job or the workflow, which every step inherits.
+        assert self.job["env"] == {"PYTHONUNBUFFERED": "1"}
+        assert "env" not in self.workflow
+
+    def test_the_loop_gets_the_nba_sheet_id_and_the_dispatch_token(self):
+        assert set(self.steps[self.LOOP]["env"]) == {
+            "GOOGLE_CREDENTIALS_PATH", "MAIN_PIPELINE_DISPATCH_TOKEN", "NBA_SPREADSHEET_ID"}
 
     def test_the_loop_polls_through_the_cycle_not_one_league_directly(self):
-        assert "python wnba_playbyplay_cycle.py poll" in self.text
-        assert "python wnba_playbyplay_cycle.py gate" in self.text
-        assert "python wnba_playbyplay_live.py" not in self.text
+        loop = self.steps[self.LOOP]["run"]
+        assert "python wnba_playbyplay_cycle.py poll || FAILED=1" in loop
+        assert "if ! python wnba_playbyplay_cycle.py gate; then" in loop
+        assert self.steps["Check whether a game is relevant right now"]["run"] == "python wnba_playbyplay_cycle.py gate"
+        assert "wnba_playbyplay_live.py" not in "".join(step.get("run", "") for step in self.job["steps"])
 
-    def test_real_runs_still_share_the_one_writing_group(self):
-        assert "'live-pbp'" in self.text and "cancel-in-progress: false" in self.text
+    def test_a_failed_poll_ends_the_run_red_after_the_loop_not_during_it(self):
+        loop = self.steps[self.LOOP]["run"].rstrip()
+        assert loop.endswith('if [ "$FAILED" -ne 0 ]; then\n'
+                             '  echo "::error::At least one poll failed during this run -- '
+                             'see the per-league errors above."\n  exit 1\nfi')
 
-    def test_a_dry_run_is_offered_and_never_given_a_dispatch_token(self):
-        assert "dry_run:" in self.text
-        dry_step = self.text.split("- name: Dry run")[1].split("- name:")[0]
-        assert "FIRSTIQ_DRY_RUN" in dry_step
-        assert "DISPATCH_TOKEN" not in dry_step
+    def test_the_built_in_token_can_only_read(self):
+        assert self.workflow["permissions"] == {"contents": "read"}
+        assert self.job["steps"][0] == {"uses": "actions/checkout@v4", "with": {"persist-credentials": False}}
+
+    def test_the_job_outlasts_a_final_cycle_in_which_both_polls_hit_their_ceiling(self):
+        assert self.job["timeout-minutes"] * 60 > 15900 + 2 * cycle.POLL_TIMEOUT_SECONDS
+        assert self.job["timeout-minutes"] < 360  # GitHub's hard cap

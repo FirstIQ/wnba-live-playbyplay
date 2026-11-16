@@ -92,8 +92,11 @@ class TestNba:
             "Golden State Warriors", "New Orleans Pelicans", "New York Knicks",
             "San Antonio Spurs", "Utah Jazz", "Washington Wizards")} == {"GS", "NO", "NY", "SA", "UTAH", "WSH"}
 
-    def test_the_sheet_is_not_the_wnba_sheet(self):
-        assert leagues.NBA.spreadsheet_id != leagues.WNBA.spreadsheet_id
+    def test_the_sheet_id_is_not_in_the_repo(self):
+        """It comes from NBA_SPREADSHEET_ID; the tests run without it
+        (conftest.py), and test_nba.py covers what a bad one does."""
+        assert leagues.NBA.spreadsheet_id == ""
+        assert leagues.sheet_problem(leagues.NBA) == "no sheet ID is configured"
 
 
 @pytest.mark.parametrize("league", leagues.ALL, ids=lambda league: league.key)

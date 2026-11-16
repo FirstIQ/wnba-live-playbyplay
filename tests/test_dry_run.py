@@ -93,7 +93,7 @@ class TestADryPoll:
         assert world.dispatched == []
 
     @pytest.mark.parametrize("can_edit, says", [
-        (True, "can edit this sheet: yes"), (False, "can edit this sheet: NO")])
+        (True, "can edit this sheet: yes"), (False, "can edit this sheet: NO")])  # then "(as Drive reports it)"
     def test_it_reports_whether_the_account_could_have_written(self, monkeypatch, dry, capsys, can_edit, says):
         world = wnba_world(can_edit=can_edit).run(monkeypatch)
         assert says in capsys.readouterr().out

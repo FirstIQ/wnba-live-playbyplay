@@ -50,10 +50,18 @@ WATCHER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wnba_playbyp
 
 # A poll normally takes well under a minute. The Sheets client has no
 # timeout of its own, so without a ceiling one hung request would hold the
-# other league (and the whole loop) until the job's 300-minute limit, which
-# also skips the hand-off. 15 minutes is far past a poll that is merely slow:
-# every request retrying its full backoff (sheets.py) still finishes inside it.
-POLL_TIMEOUT_SECONDS = 900
+# other league (and the whole loop) until the job's time limit, which also
+# skips the hand-off.
+#
+# 20 minutes, so that a poll which is merely slow is never cut off: one that
+# rewrites the tab sends 13 retryable requests, and if every one of them ran
+# its full backoff (about 75s each, sheets.py) it would take about 16
+# minutes. Stopping a poll between its clear() and its rows landing leaves
+# the tab empty, so the ceiling must sit past that, not inside it.
+#
+# live-playbyplay.yml's job limit allows for both leagues hitting this in
+# the final cycle (265 + 2 x 20 minutes) and still running the hand-off.
+POLL_TIMEOUT_SECONDS = 1200
 
 
 def any_league_relevant():

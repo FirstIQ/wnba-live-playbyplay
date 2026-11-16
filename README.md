@@ -43,6 +43,9 @@ silently drops every game that team plays.
     the run still ends red.
 - The pipeline dispatches (`intraday-updates.yml`, `live-grading.yml`) are
   the same for both leagues: those `bball-bots` workflows run every league.
+  Each is sent **once per poll**, covering every game that is due, not once
+  per game: the NBA tips many games at the same minute, and the intraday
+  workflow has no concurrency group and spends odds credits on every run.
 
 ## Dry run
 
@@ -54,12 +57,14 @@ nothing.
   gate says. It runs in its own concurrency group, so it neither waits for
   a live run nor blocks one.
 - **Locally:** `FIRSTIQ_DRY_RUN=1 FIRSTIQ_LEAGUE=nba python wnba_playbyplay_live.py`
-  (or `--dry-run`). It still needs the service account file, to read.
+  (or `--dry-run`). It still needs the service account file, to read, and
+  for the NBA `NBA_SPREADSHEET_ID` in the environment.
 
 What it reports per league: whether the service account can **edit** the
 sheet (asked of Drive, without writing), each tab it would create, each
 `Live First Basket` row, each new `Play By Play` row with the rewrite's row
-counts, and each dispatch.
+counts and the tab's grid size, and each dispatch a real run would send if
+it has the dispatch token.
 
 Three locks keep it from writing: the script branches around every write,
 the Sheets client refuses anything but a read (`sheets.authorize(read_only=True)`),
@@ -124,11 +129,19 @@ stops and the tracker quietly goes back to depending on the cron alone.
   signalled. So a *crash* in the gate also reads as "skip", and the run still
   reports green. `should_poll()` wraps its whole body to avoid this; keep it
   that way when editing.
+- **Sheets refuses a write past a tab's grid; it does not grow the tab.**
+  The rewrite would then clear `Play By Play` and fail to refill it. So the
+  tab is grown (by what it needs plus 5,000 rows) *before* it is cleared; if
+  growing fails the run stops with the tab untouched.
 - **A run that dies mid-write can leave `Play By Play` empty**, since the
-  script does `clear()` then rewrites the whole tab. The NBA has about four
+  script does `clear()` then rewrites the whole tab. A poll is stopped after
+  20 minutes (`POLL_TIMEOUT_SECONDS`), far past a slow one, so a hung
+  request cannot hold the other league. The NBA has about four
   times the WNBA's games, so each rewrite logs one line to measure it:
   `Play By Play rewrite [nba]: wrote N data row(s) (K kept, U for G updated
   game(s)); read back N; tab empty or partial for X.XXs, Y.YYs in all.`
+  A rewrite that fails part-way logs `Play By Play rewrite [nba]: FAILED ...`
+  before the error.
 - **The scoreboard is "today" in Eastern time.** After midnight ET a late
   game drops off both the gate and the poll. Openings are captured within
   minutes of the tip, so this only shortens the retries for a late West

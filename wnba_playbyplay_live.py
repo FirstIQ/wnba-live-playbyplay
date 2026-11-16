@@ -96,6 +96,10 @@ _DRY_RUN_OFF = {"", "0", "false", "no", "off"}
 
 PBP_HEADER = ["Event ID", "Date", "Matchup", "Period", "Clock", "Seconds Remaining", "Team",
               "Away Score", "Home Score", "Play", "Scoring Play (Y/N)"]
+# Rows added whenever the Play By Play tab has to be grown, so it is not
+# grown again every night. The same headroom bball-bots' own play-by-play
+# step uses (SCRIPTS/wnba_playbyplay_tab.py).
+PBP_GRID_HEADROOM_ROWS = 5000
 
 FB_SHEET_NAME = "Live First Basket"
 FB_HEADER = ["Event ID", "Date", "Matchup", "Player", "Athlete ID", "Team", "Position",
@@ -475,11 +479,14 @@ def report_edit_access(client, spreadsheet_id):
             if status == 403 else ""
         print(f"DRY RUN: the service account can edit this sheet: unknown ({reason}){hint}")
         return
+    # Drive's answer is about the account, not about this run's read-only
+    # token -- but that is Google's documented behaviour, not something this
+    # repo has seen fail, so the line says whose answer it is.
     if can_edit:
-        print("DRY RUN: the service account can edit this sheet: yes")
+        print("DRY RUN: the service account can edit this sheet: yes (as Drive reports it)")
     else:
-        print("DRY RUN: the service account can edit this sheet: NO -- a real run would fail on its "
-              "first write. Share the sheet with the service account as Editor.")
+        print("DRY RUN: the service account can edit this sheet: NO (as Drive reports it) -- a real run "
+              "would fail on its first write. Share the sheet with the service account as Editor.")
 
 
 def main():
@@ -516,8 +523,9 @@ def main():
     fb_known_event_ids = {r[0] for r in data_rows(fb_ws) if r}
 
     dispatch_token = os.environ.get("MAIN_PIPELINE_DISPATCH_TOKEN")
-    # A dry run reports the dispatches a real run would send, whether or
-    # not it was handed the token (the workflow's dry-run step is not).
+    # A dry run reports the dispatches a real run would send IF it has the
+    # token, whether or not the dry run was handed it (the workflow's
+    # dry-run step is not). A real run without the token sends none.
     can_dispatch = bool(dispatch_token) or dry_run
     dispatch_ws = get_or_create_tab(spreadsheet, DISPATCH_LOG_SHEET_NAME, DISPATCH_LOG_HEADER, dry_run)
     dispatched_event_ids = {r[0] for r in data_rows(dispatch_ws) if r}
@@ -531,6 +539,8 @@ def main():
     today_str = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
     now_str = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
+    # Today's real games that have tipped off, in scoreboard order.
+    games = []
     for event in events:
         state = event["status"]["type"]["state"]
         if state == "pre":
@@ -549,30 +559,39 @@ def main():
         away_c = next(c for c in competitors if c["homeAway"] == "away")["team"]
         home = get_abbr(home_c["displayName"], home_c.get("abbreviation", ""))
         away = get_abbr(away_c["displayName"], away_c.get("abbreviation", ""))
-        matchup = f"{away} @ {home}"
-        event_id = event["id"]
+        games.append((event, event["id"], f"{away} @ {home}", state))
 
-        if (
-            can_dispatch
-            and event_id not in dispatched_event_ids
-            and is_a_few_minutes_into_first_quarter(event)
-        ):
-            dispatch_row = [event_id, today_str, matchup, now_str]
-            if dry_run:
-                print(f"  DRY RUN: {matchup} is a few minutes into Q1 -- would dispatch "
-                      f"{MAIN_PIPELINE_INTRADAY_WORKFLOW} and log {dispatch_row} to '{DISPATCH_LOG_SHEET_NAME}'.")
+    # The post-tip refresh: ONE dispatch per poll, covering every game that
+    # is a few minutes into Q1 and has not had one. It used to be one per
+    # game. The pipeline's intraday workflow refreshes the whole league (and
+    # spends odds credits) whichever game asked, and has no concurrency
+    # group -- so five NBA games tipping at 7:00 started five identical runs
+    # within seconds, racing on the same tabs.
+    post_tip = [(event_id, matchup) for event, event_id, matchup, _ in games
+                if can_dispatch and event_id not in dispatched_event_ids
+                and is_a_few_minutes_into_first_quarter(event)]
+    if post_tip:
+        names = ", ".join(m for _, m in post_tip)
+        post_tip_rows = [[event_id, today_str, matchup, now_str] for event_id, matchup in post_tip]
+        if dry_run:
+            print(f"  DRY RUN: {names}: a few minutes into Q1 -- would dispatch "
+                  f"{MAIN_PIPELINE_INTRADAY_WORKFLOW} once and log {len(post_tip_rows)} row(s) "
+                  f"to '{DISPATCH_LOG_SHEET_NAME}':")
+            for row in post_tip_rows:
+                print(f"    {row}")
+        else:
+            print(f"  {names}: a few minutes into Q1 -- triggering an early intraday pipeline refresh...")
+            if trigger_main_pipeline_workflow(dispatch_token, MAIN_PIPELINE_INTRADAY_WORKFLOW):
+                # Log immediately, before doing anything else that could fail --
+                # otherwise a later exception this run leaves the dispatch fired
+                # but unrecorded, and the next run fires it again.
+                dispatch_ws.append_rows(post_tip_rows, value_input_option="USER_ENTERED")
+                dispatched_event_ids.update(event_id for event_id, _ in post_tip)
+                print("    Triggered and logged.")
             else:
-                print(f"  {matchup} is a few minutes into Q1 -- triggering an early intraday pipeline refresh...")
-                if trigger_main_pipeline_workflow(dispatch_token, MAIN_PIPELINE_INTRADAY_WORKFLOW):
-                    # Log immediately, before doing anything else that could fail --
-                    # otherwise a later exception this run leaves the dispatch fired
-                    # but unrecorded, and the next run fires it again.
-                    dispatch_ws.append_row(dispatch_row, value_input_option="USER_ENTERED")
-                    dispatched_event_ids.add(event_id)
-                    print("    Triggered and logged.")
-                else:
-                    print("    Dispatch failed -- will retry next run.")
+                print("    Dispatch failed -- will retry next run.")
 
+    for event, event_id, matchup, state in games:
         rows_for_event = [r for r in existing_rows if r and r[0] == event_id]
         if rows_for_event and event_already_captured(rows_for_event):
             # Nothing left to fetch for this game -- but if its grading
@@ -661,17 +680,45 @@ def main():
         counts = (f"{len(all_rows)} data row(s) ({len(kept_rows)} kept, "
                   f"{len(all_rows) - len(kept_rows)} for {len(updates)} updated game(s))")
 
+        # The rewrite names rows 2..n+1. Sheets REFUSES a write past the
+        # tab's grid; it does not grow the tab. Without this, the first
+        # rewrite to outgrow the grid would clear the tab, fail to refill
+        # it, and leave the next poll to take an empty tab as the truth.
+        # So the tab is grown BEFORE it is cleared; if growing fails, the
+        # run stops with the tab untouched. bball-bots' own step grows the
+        # tab the same way, but only when ITS morning append overflows --
+        # and once this watcher captures every game live, that step has
+        # little left to append.
+        rows_needed = len(all_rows) + 1
+        grid_rows = pbp_ws.row_count if pbp_ws is not None else 0
+        grow_to = rows_needed + PBP_GRID_HEADROOM_ROWS if rows_needed > grid_rows else None
+
         if dry_run:
-            print(f"DRY RUN: would rewrite '{PBP_SHEET_NAME}': {counts}. The new rows:")
+            if grow_to:
+                print(f"DRY RUN: would first grow '{PBP_SHEET_NAME}' from {grid_rows} to {grow_to} rows "
+                      f"(the rewrite needs {rows_needed}).")
+            print(f"DRY RUN: would rewrite '{PBP_SHEET_NAME}': {counts}; the tab's grid has "
+                  f"{grid_rows} row(s). The new rows:")
             for row in all_rows[len(kept_rows):]:
                 print(f"    {row}")
         else:
+            if grow_to:
+                print(f"  Growing '{PBP_SHEET_NAME}' from {grid_rows} to {grow_to} rows before the rewrite "
+                      f"(it needs {rows_needed}).")
+                pbp_ws.resize(rows=grow_to)
             print(f"Writing Play By Play: {len(kept_rows)} untouched row(s) kept, {len(updates)} game(s) updated.")
             started = time.monotonic()
-            pbp_ws.clear()
-            pbp_ws.update(range_name="A1", values=[PBP_HEADER], value_input_option="USER_ENTERED")
-            if all_rows:
-                pbp_ws.update(range_name=f"A2:K{len(all_rows) + 1}", values=all_rows, value_input_option="RAW")
+            try:
+                pbp_ws.clear()
+                pbp_ws.update(range_name="A1", values=[PBP_HEADER], value_input_option="USER_ENTERED")
+                if all_rows:
+                    pbp_ws.update(range_name=f"A2:K{len(all_rows) + 1}", values=all_rows, value_input_option="RAW")
+            except Exception:
+                # The case the timing line below exists to measure, so it
+                # is said here too before the error ends the run.
+                print(f"Play By Play rewrite [{league.key}]: FAILED {time.monotonic() - started:.2f}s in, "
+                      f"while writing {counts}. The tab may be empty or partial until a poll rewrites it.")
+                raise
             refilled = time.monotonic()
 
             # Assert the rewrite did what it claimed. A clear() that succeeded

@@ -27,11 +27,18 @@ class FrozenDatetime(datetime):
         return NOW.astimezone(tz) if tz else NOW.replace(tzinfo=None)
 
 
+class GridLimitExceeded(Exception):
+    """What Sheets answers (a 400) when a write names a row past the tab's
+    grid: it refuses the write, it does not grow the tab."""
+
+
 class FakeWorksheet:
-    def __init__(self, title, values):
+    def __init__(self, title, values, row_count=5000):
         self.title = title
         self.values = [list(r) for r in values]
+        self.row_count = row_count
         self.ops = []
+        self.fail_on = None  # an op name that raises instead of running
 
     @property
     def writes(self):
@@ -49,13 +56,26 @@ class FakeWorksheet:
         self.ops.append("append_rows")
         self.values.extend(list(r) for r in rows)
 
+    def _maybe_fail(self, op):
+        if self.fail_on == op:
+            raise RuntimeError(f"{op} failed")
+
     def clear(self):
+        self._maybe_fail("clear")
         self.ops.append("clear")
         self.values = []
 
+    def resize(self, rows=None, cols=None):
+        self._maybe_fail("resize")
+        self.ops.append(f"resize:{rows}")
+        self.row_count = rows
+
     def update(self, *, range_name, values, value_input_option=None):
-        self.ops.append(f"update:{range_name}")
+        self._maybe_fail(f"update:{range_name.split(':')[0]}")
         first = int("".join(ch for ch in range_name.split(":")[0] if ch.isdigit())) - 1
+        if first + len(values) > self.row_count:
+            raise GridLimitExceeded(f"{range_name} exceeds grid limits. Max rows: {self.row_count}")
+        self.ops.append(f"update:{range_name}")
         while len(self.values) < first + len(values):
             self.values.append([])
         for offset, row in enumerate(values):
@@ -74,7 +94,7 @@ class FakeSpreadsheet:
 
     def add_worksheet(self, title, rows, cols):
         self.created.append(title)
-        self.tabs[title] = FakeWorksheet(title, [])
+        self.tabs[title] = FakeWorksheet(title, [], row_count=rows)
         return self.tabs[title]
 
 

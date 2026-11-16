@@ -145,15 +145,21 @@ def sheet_problem(league):
     echoes the ID. The third check is the one that matters most: FIRSTIQ_LEAGUE
     refuses a typo, but a sheet ID that arrives from the environment could
     still be ANOTHER league's sheet, and then one league's plays are written
-    into the other's tabs with nothing to notice."""
+    into the other's tabs with nothing to notice.
+
+    That check runs one way only: a league is refused when a league EARLIER
+    in ALL already has the same sheet. So a wrong NBA ID stops the NBA and
+    never the WNBA, whose ID is written above."""
     if not league.spreadsheet_id:
         return "no sheet ID is configured"
     if not _SHEET_ID.fullmatch(league.spreadsheet_id):
         return ("its sheet ID is not a sheet ID -- it must be the ID alone, not the sheet's URL, "
                 "with no spaces or line breaks")
-    if any(other is not league and other.key != league.key and other.spreadsheet_id == league.spreadsheet_id
-           for other in ALL):
-        return "its sheet ID is another league's sheet"
+    for earlier in ALL:
+        if earlier.key == league.key:
+            break
+        if earlier.spreadsheet_id == league.spreadsheet_id:
+            return "its sheet ID is another league's sheet"
     return None
 
 

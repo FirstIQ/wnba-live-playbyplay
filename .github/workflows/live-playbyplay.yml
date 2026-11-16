@@ -51,9 +51,11 @@ concurrency:
 jobs:
   live-pbp:
     runs-on: ubuntu-latest
-    # Comfortably above the ~265-minute loop below, well under GitHub's
-    # 360-minute hard cap for hosted runners.
-    timeout-minutes: 300
+    # Above the ~265-minute loop below plus a final cycle in which both
+    # leagues' polls run to their 20-minute ceiling
+    # (wnba_playbyplay_cycle.py), with room left for the hand-off. Under
+    # GitHub's 360-minute hard cap for hosted runners.
+    timeout-minutes: 320
     env:
       # The cycle runner starts one Python process per league. Unbuffered,
       # so its own lines and each league's lines reach the log in the order
