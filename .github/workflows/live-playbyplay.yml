@@ -1,9 +1,10 @@
-name: WNBA Live Play By Play
+name: Live Play By Play (WNBA and NBA)
 
 on:
   schedule:
     # Hourly check-in instead of 3 big blind ~4.5h windows. Each firing runs
-    # wnba_playbyplay_gate.py first, which looks at TODAY's real game times
+    # the gate first (wnba_playbyplay_cycle.py gate, which asks
+    # wnba_playbyplay_gate.py about each league), which looks at TODAY's real game times
     # (not a guessed clock window) and decides whether there's anything
     # worth polling for right now; the actual poll loop below only runs
     # when the gate says yes. This also shrinks the blast radius of a
@@ -18,25 +19,53 @@ on:
     # is already going is harmlessly dropped by the concurrency group below.
     - cron: "0 * * * *"
     - cron: "30 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: one pass over both leagues. Prints what it would write. Writes nothing, dispatches nothing."
+        type: boolean
+        default: false
+
+# Nothing here uses the built-in token: the dispatches use their own tokens.
+permissions:
+  contents: read
 
 concurrency:
-  # Never let two of these loops write to the shared Google Sheet at the
+  # Never let two of these loops write to the shared Google Sheets at the
   # same time -- the script does a full clear()+rewrite of the Play By
   # Play tab, so an overlapping run could wipe out the other's writes.
   # Queue (don't cancel) so a later firing just waits its turn instead of
   # losing the run outright.
-  group: live-pbp
+  #
+  # Both leagues poll inside this one job, one after the other, so the
+  # group also keeps the WNBA and the NBA from writing at the same time.
+  #
+  # A dry run writes nothing, so it gets a group of its own: in `live-pbp`
+  # it would wait behind a real run for up to ~4.4 hours, and GitHub keeps
+  # only one waiting run per group, so the next cron firing would cancel it.
+  # `inputs.dry_run` is empty on a schedule firing and on the self-chain's
+  # dispatch, which both land in `live-pbp`.
+  group: ${{ inputs.dry_run && 'live-pbp-dry-run' || 'live-pbp' }}
   cancel-in-progress: false
 
 jobs:
   live-pbp:
     runs-on: ubuntu-latest
-    # Comfortably above the ~265-minute loop below, well under GitHub's
-    # 360-minute hard cap for hosted runners.
-    timeout-minutes: 300
+    # Above the ~265-minute loop below plus a final cycle in which both
+    # leagues' polls run to their 20-minute ceiling
+    # (wnba_playbyplay_cycle.py), with room left for the hand-off. Under
+    # GitHub's 360-minute hard cap for hosted runners.
+    timeout-minutes: 320
+    env:
+      # The cycle runner starts one Python process per league. Unbuffered,
+      # so its own lines and each league's lines reach the log in the order
+      # they happened instead of in the order the buffers were flushed.
+      PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@v4
+        with:
+          # No step runs git after this, so no step needs the token left on disk.
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:
@@ -46,33 +75,57 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # Passes if EITHER league has a relevant game. Exit 1 is "skip", which
+      # is why this step is allowed to fail.
       - name: Check whether a game is relevant right now
         id: gate
-        run: python wnba_playbyplay_gate.py
+        run: python wnba_playbyplay_cycle.py gate
         continue-on-error: true
 
       - name: Write Google service account credentials
-        if: steps.gate.outcome == 'success'
+        if: ${{ steps.gate.outcome == 'success' || inputs.dry_run }}
         run: printf '%s' "$GOOGLE_CREDENTIALS_JSON" > "$RUNNER_TEMP/gcreds.json"
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+
+      # Manual only (Run workflow -> dry_run). One pass over both leagues,
+      # whatever the gate said. It reads the sheets and ESPN as a real poll
+      # does and prints every row and dispatch a real poll would produce.
+      # Three locks keep it from writing: the script branches around each
+      # write, the Sheets client refuses anything but a read, and Google is
+      # asked for read-only access. It is given no token that could start
+      # another workflow.
+      - name: Dry run (one pass, writes nothing)
+        if: ${{ inputs.dry_run }}
+        env:
+          FIRSTIQ_DRY_RUN: "true"
+          GOOGLE_CREDENTIALS_PATH: ${{ runner.temp }}/gcreds.json
+          NBA_SPREADSHEET_ID: ${{ secrets.NBA_SPREADSHEET_ID }}
+        run: python wnba_playbyplay_cycle.py poll
 
       # "Opening plays" -- everything up to the point where BOTH teams have
       # logged their own first scoring play. This used to stop at the first 4
       # minutes of Q1 and the step name still said so long after the code
       # changed; a fixed window silently drops the First Team Basket market
       # whenever the slower-scoring team is not on the board that early.
+      #
+      # Each cycle polls the WNBA, then the NBA, skipping a league with no
+      # game on (wnba_playbyplay_cycle.py). One league failing does not stop
+      # the other or end the loop: the failure is annotated, the next cycle
+      # retries it, and the step still ends red so it is not missed.
       - name: Capture live opening play by play (polls every 5 min, up to ~4.4h)
-        if: steps.gate.outcome == 'success'
+        if: ${{ steps.gate.outcome == 'success' && !inputs.dry_run }}
         env:
           GOOGLE_CREDENTIALS_PATH: ${{ runner.temp }}/gcreds.json
           MAIN_PIPELINE_DISPATCH_TOKEN: ${{ secrets.MAIN_PIPELINE_DISPATCH_TOKEN }}
+          NBA_SPREADSHEET_ID: ${{ secrets.NBA_SPREADSHEET_ID }}
         run: |
           # ~265 minutes is a ceiling, not a target. The loop normally ends
           # earlier, when the gate says the slate is over -- see below.
           END=$((SECONDS + 15900))
+          FAILED=0
           while true; do
-            python wnba_playbyplay_live.py
+            python wnba_playbyplay_cycle.py poll || FAILED=1
             if [ "$SECONDS" -ge "$END" ]; then
               echo "Hit the ~265-minute ceiling -- exiting; the next hourly firing takes over."
               break
@@ -82,20 +135,27 @@ jobs:
             # the `live-pbp` concurrency group for the full ceiling even once
             # every game has finished, which blocks the next ~4 hourly
             # firings and defeats the point of checking in hourly at all.
-            if ! python wnba_playbyplay_gate.py; then
+            if ! python wnba_playbyplay_cycle.py gate; then
               echo "Nothing relevant left today -- exiting early to free the concurrency group."
               break
             fi
           done
+          if [ "$FAILED" -ne 0 ]; then
+            echo "::error::At least one poll failed during this run -- see the per-league errors above."
+            exit 1
+          fi
 
       # The poll loop above is capped at ~265 minutes. If it hit that cap
       # while games were still on, nothing would restart it until the next
       # `schedule` firing lands -- and those are precisely what this repo
       # cannot count on. Hand off to a fresh run instead, so one delivered
       # event sustains coverage for the whole slate. No-ops when the slate
-      # is over or no token is configured.
+      # is over in every league or no token is configured.
+      #
+      # !cancelled(): the loop step ends red when a poll failed along the
+      # way, and that must not cost the rest of the slate its successor.
       - name: Hand off to a fresh run if games are still live
-        if: steps.gate.outcome == 'success'
+        if: ${{ !cancelled() && steps.gate.outcome == 'success' && !inputs.dry_run }}
         env:
           SELF_DISPATCH_TOKEN: ${{ secrets.SELF_DISPATCH_TOKEN }}
           MAIN_PIPELINE_DISPATCH_TOKEN: ${{ secrets.MAIN_PIPELINE_DISPATCH_TOKEN }}

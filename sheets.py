@@ -92,7 +92,11 @@ def _request_method(args, kwargs):
     return method.upper() if isinstance(method, str) else None
 
 
-def authorize(creds):
+class ReadOnlyViolation(RuntimeError):
+    """A dry run tried to send something other than a read."""
+
+
+def authorize(creds, read_only=False):
     """gspread.authorize(), plus retry on quota and transient errors.
 
     5 attempts with ~5s/10s/20s/40s jittered backoff. The read quota is
@@ -106,6 +110,11 @@ def authorize(creds):
     Only GET and PUT are retried -- see _RETRYABLE_METHODS. Retrying an
     append can duplicate a row Google already committed before it returned
     an error, and this process appends to the tab the app reads.
+
+    read_only=True is the dry run's lock. Every request that is not a GET
+    is refused HERE, before it is sent -- including a verb this cannot
+    read. The caller already branches around its writes; this is what
+    still holds if a new write is ever added without that branch.
     """
     client = gspread.authorize(creds)
 
@@ -124,6 +133,10 @@ def authorize(creds):
         return inner(*args, **kwargs)
 
     def request(*args, **kwargs):
+        if read_only and _request_method(args, kwargs) != "GET":
+            raise ReadOnlyViolation(
+                f"dry run: refused a {_request_method(args, kwargs) or 'unreadable'} request "
+                f"to Google Sheets; a dry run only reads.")
         if _request_method(args, kwargs) in _RETRYABLE_METHODS:
             return _request_with_retry(*args, **kwargs)
         # Non-idempotent (POST: values:append, batchUpdate). One attempt,

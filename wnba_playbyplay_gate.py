@@ -1,5 +1,5 @@
 """
-WNBA LIVE PLAY BY PLAY -- SCHEDULE GATE
+LIVE PLAY BY PLAY -- SCHEDULE GATE
 ----------------------------------------------------------------------------
 Decides whether live-playbyplay.yml's polling loop is actually worth running
 right now, based on TODAY's real game times -- not a blind guessed clock
@@ -42,14 +42,19 @@ fetch: an unhandled shape change anywhere in here would otherwise exit
 non-zero, which the workflow reads as "skip" -- a silent no-op on a run that
 still reports green.
 
-Reuses get_todays_events()/REAL_TEAMS from wnba_playbyplay_live.py rather
-than re-implementing the ESPN scoreboard fetch -- same repo, same source of
-truth for "what counts as a real game today."
+Reuses get_todays_events() and the league's real teams from
+wnba_playbyplay_live.py rather than re-implementing the ESPN scoreboard
+fetch -- same repo, same source of truth for "what counts as a real game
+today."
+
+One league at a time: run directly, this answers for the FIRSTIQ_LEAGUE
+league (the WNBA when unset). The workflow asks about every league through
+wnba_playbyplay_cycle.py, which passes each league in here in turn.
 """
 
 from datetime import datetime, timezone
 
-from wnba_playbyplay_live import REAL_TEAMS, get_todays_events
+import wnba_playbyplay_live as live
 
 # Must comfortably exceed the cron interval, or there is a systematic blind
 # window before every tip. With hourly firings and a 15-minute lookahead, a
@@ -85,7 +90,8 @@ def _tip_time(event):
         return None
 
 
-def _game_is_relevant_now(event, now_utc):
+def _game_is_relevant_now(event, now_utc, league=None):
+    league = league or live.LEAGUE
     competitors = (event.get("competitions") or [{}])[0].get("competitors", [])
     team_names = {c.get("team", {}).get("displayName") for c in competitors}
     if not team_names:
@@ -93,8 +99,8 @@ def _game_is_relevant_now(event, now_utc):
         # live game, and an extra poll is free -- fail open rather than
         # silently ignoring an event whose shape we don't recognise.
         return True
-    if not team_names.issubset(REAL_TEAMS):
-        return False  # exhibition/All-Star -- never relevant
+    if not team_names.issubset(league.real_teams):
+        return False  # exhibition/All-Star, or another league's game -- never relevant
 
     state = event.get("status", {}).get("type", {}).get("state")
     if state == "in":
@@ -116,17 +122,18 @@ def _game_is_relevant_now(event, now_utc):
     return -LOOKAHEAD_MINUTES <= minutes_from_tip <= POST_GAME_GRACE_MINUTES
 
 
-def should_poll():
+def should_poll(league=None):
+    league = league or live.LEAGUE
     now_utc = datetime.now(timezone.utc)
     try:
-        for event in get_todays_events():
+        for event in live.get_todays_events(league):
             if event.get("season", {}).get("slug") != "regular-season":
                 continue
-            if _game_is_relevant_now(event, now_utc):
+            if _game_is_relevant_now(event, now_utc, league):
                 return True
         return False
     except Exception as e:
-        print(f"Could not decide from today's scoreboard ({e}) -- failing open, will poll.")
+        print(f"Could not decide from today's {league.name} scoreboard ({e}) -- failing open, will poll.")
         return True
 
 
